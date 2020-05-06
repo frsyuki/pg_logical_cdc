@@ -16,6 +16,6 @@ clean:
 	rm -rf test/.bundlerw
 
 docker:
-	docker build -t pg_logical_stream:latest .
+	docker build --rm -t pg_logical_stream:latest .
 
 .PHONY: test all clean docker

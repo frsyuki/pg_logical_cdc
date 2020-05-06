@@ -158,7 +158,7 @@ pipe
 ### Build and test using docker
 
 ```
-make docker
+make clean docker
 ```
 
 You will get `pg_logical_stream` in src/.

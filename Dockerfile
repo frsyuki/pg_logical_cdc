@@ -11,7 +11,7 @@ COPY ["src", "./src/"]
 COPY ["test", "./test/"]
 
 RUN sudo -u postgres /mnt/test/setup_postgres.sh /usr/lib/postgresql/11/bin /var/lib/postgresql/data && \
-    sudo -u postgres env PGHOST=localhost PGUSER=postgres PGDATABASE=test make
+    env PGHOST=localhost PGUSER=postgres PGDATABASE=test make
 
 FROM postgres:11
 WORKDIR /mnt
