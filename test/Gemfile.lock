@@ -22,9 +22,9 @@ PLATFORMS
   ruby
 
 DEPENDENCIES
-  pg
-  rake
-  rspec
+  pg (~> 1)
+  rake (~> 13)
+  rspec (~> 3)
 
 BUNDLED WITH
-   2.1.4
+   1.17.2

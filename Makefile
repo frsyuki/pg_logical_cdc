@@ -11,6 +11,9 @@ test: build
 clean:
 	cd src && make clean
 	rm -rf test/vendor/bundle
+	rm -rf test/vendor/gems
+	rm -rf test/.bundle
+	rm -rf test/.bundlerw
 
 docker:
 	docker build -t pg_logical_stream:latest .
