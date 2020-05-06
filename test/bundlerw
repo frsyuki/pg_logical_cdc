@@ -1,0 +1,36 @@
+#!/bin/sh
+
+if [ -f .bundlerw ]; then
+    . ./.bundlerw
+fi
+
+which bundle >/dev/null 2>&1
+if [ $? -ne 0 ]; then
+    which gem >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        echo "Ruby is not installed."
+        echo "Install ruby and run again."
+        exit 1
+    fi
+
+    echo "+ gem install bundler"
+    export GEM_HOME="`pwd`/vendor/gems"
+    GEM_BIN_PATH="`pwd`/vendor/gems/bin"
+    export PATH="$PATH:$GEM_BIN_PATH"
+    echo "export GEM_HOME=\"$GEM_HOME\"" > .bundlerw
+    echo "export PATH=\"\$PATH:$GEM_BIN_PATH\"" >> .bundlerw
+    gem install bundler
+fi
+
+if [ ! -f Gemfile.lock ] || [ ! -d .bundle ]; then
+    echo "+ bundle install --path vendor/bundle"
+    bundle install --path vendor/bundle
+fi
+
+if [ ! -d vendor/bundle ]; then
+    echo "+ bundle"
+    bundle
+fi
+
+exec bundle "$@"
+

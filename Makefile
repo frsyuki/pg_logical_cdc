@@ -1,0 +1,18 @@
+EXE := $(shell pwd)/src/pg_logical_stream
+
+all: test
+
+build:
+	cd src && make
+
+test: build
+	cd test && EXE=$(EXE) ./bundlerw exec rake
+
+clean:
+	cd src && make clean
+	rm -rf test/vendor/bundle
+
+docker:
+	docker build -t pg_logical_stream:latest .
+
+.PHONY: test all clean docker
