@@ -21,11 +21,15 @@ Options:
   -v, --verbose                show verbose messages
   -S, --slot NAME              name of the logical replication slot
   -o, --option KEY[=VALUE]     pass option NAME with optional value VALUE to the replication slot
+  -c, --create-slot NAME       create a logical replication slot if not exist using given plugin
+  -L, --poll-mode SECS         check availability of the replication slot at most given amount of time
+                               and then exit without outputting data
   -D, --fd INTEGER             use the given file descriptor number instead of 1 (stdout)
   -F, --feedback-interval SEC  maximum delay to send feedback to the replication slot (default: 0.000)
-  -s, --status-interval SECS   time between status messages sent to the server (default: 5.000)
+  -s, --status-interval SECS   time between status messages sent to the server (default: 1.000)
   -A, --auto-feedback          send feedback automatically
   -H, --write-header           write a header line every before a record
+  -X, --fixed-length-header    pad a header by spaces so that a header length becomes always 31 bytes
   -N, --write-nl               write a new line character every after a record
   -j, --wal2json1              equivalent to -o format-version=1 -o include-lsn=true
   -J  --wal2json2              equivalent to -o format-version=2 --write-header
@@ -94,12 +98,14 @@ If you give `--write-header` option, pg_logical_stream dumps a record with a hea
 Format of a header is:
 
 ```
-w <LSN> <LENGTH>\n
+w <LSN> <LENGTH>[PADDING]\n
 ```
 
 * `<LSN>` is the offset of the record. Format of a LSN is "%X/%X" (slash-separated two integers in hex format).
 
 * `<LENGTH>` is the length of a change record followed by the header.
+
+* If --fixed-length-header is set, `[PADDING]` is filled with space characters (' ') so that length of a header including \n character is always 31 bytes.
 
 * `\n` is a new-line character.
 
@@ -111,11 +117,12 @@ w 0/2B357690 196
 {"change":[{"kind":"insert","schema":"public","table":"test","columnnames":["id","n1","n2","n3","n4"],"columntypes":["integer","bigint","bigint","bigint","bigint"],"columnvalues":[108,5,5,5,5]}]}
 w 0/2B357890 196
 {"change":[{"kind":"insert","schema":"public","table":"test","columnnames":["id","n1","n2","n3","n4"],"columntypes":["integer","bigint","bigint","bigint","bigint"],"columnvalues":[109,5,5,5,5]}]}
-w 0/2B3586D0 196
 ...
 ```
 
-### Input command
+### Feedback command
+
+Send a feedback command to STDIN for sending a feedback message.
 
 Format of a feedback command is:
 
@@ -123,9 +130,76 @@ Format of a feedback command is:
 F <LSN>\n
 ```
 
-* `<LSN>` is the LSN received as a part of output header.
+* `<LSN>` is the last LSN received as a part of output header.
 
 * `\n` is a new-line character.
+
+### Quit command
+
+Send quit command to STDIN for shutting down.
+
+Format of a quit command is:
+
+```
+q\n
+```
+
+### SIGINT signal
+
+Sending SIGINT signal exits pg_logical_stream. However, quit command is recommended
+because SIGNAL may arrive earlier than processing a feedback command buffered in the
+pipe. To make sure that a feedback command written to STDIN is sent to PostgreSQL,
+use quit command instead.
+
+
+## Poll mode
+
+If `--poll-mode SECS` is set, pg_logical_stream runs in poll mode. Poll mode is useful
+for HA configuration - a backup node takes over replication immediately when active node
+crashes.
+
+pg_logical_stream in poll mode doesn't output records. When it exits with code 0 (SUCCESS),
+run pg_logical_stream again without poll mode.
+
+Polling interval is configurable using --status-interval argument.
+
+Example use of poll-mode looks like as following:
+
+```
+#!/bin/sh
+
+while true; do
+  # Run in poll mode.
+  pg_logical_stream --slot test_slot --poll-mode 60 --create-slot wal2json
+  ecode=$?
+
+  # If exist code is 0, slot is ready. Run pg_logical_stream without poll mode.
+  if [ $ecode -eq 0 ]; then
+    pg_logical_stream --slot test_slot -J
+    ecode=$?
+  fi
+
+  # If exist code not is 9 (SLOT_IN_USE), thre was an error.
+  if [ $ecode -nq 9 ]; then
+    exit $ecode
+  fi
+
+  # If exit code is 9 (SLOT_IN_USE), slot is not ready. Retry poll mode again.
+done
+```
+
+## Exit code
+
+* 0 = SUCCESS. Command exited with no errors.
+* 1 = INVALID_ARGS. Command exited before attempting to establish a PostgreSQL connection.
+* 2 = INIT_FAILED. An error occurred during establishing or initializing a PostgreSQL connection.
+* 3 = PG_CLOSED. PostgreSQL connection is closed.
+* 4 = CMD_CLOSED. STDIN is closed.
+* 5 = PG_ERROR. An error occurred during dealing with the PostgreSQL connection.
+* 6 = CMD_ERROR. An error occurred during dealing with STDIN.
+* 7 = SYSTEM_ERROR. Other fatal errors.
+* 8 = SLOT_NOT_EXIST. Replication slot does not exist or is not accessible.
+* 9 = SLOT_IN_USE. Replication slot is being used by another client.
 
 ## Example code
 
@@ -134,6 +208,7 @@ F <LSN>\n
 
 # Start pg_logical_stream
 pipe = IO.popen("pg_logical_stream --slot test_slot --wal2json2", "r+")
+
 while true
   # Receive a header line from STDOUT
   header = pipe.gets
@@ -149,7 +224,7 @@ while true
 
   # Feedback LSN to STDIN
   pipe.puts "F #{LSN}"
-pipe
+end
 ```
 
 
@@ -195,5 +270,8 @@ $ export PGDATABASE=<PostgreSQL database name>
 
 # Then, run "make test"
 $ make test
+
+# Running one test only
+$ SPEC=spec/run_spec.rb:117 make test
 ```
 
