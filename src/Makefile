@@ -4,7 +4,7 @@ CFLAGS := -Wall -O2
 LDFLAGS := -lpq
 CC := cc
 
-pg_logical_stream:
+pg_logical_stream: pg_logical_stream.c postgres_func.h
 	$(CC) $(PG_CONFIG_FLAGS) $(CFLAGS) $(LDFLAGS) pg_logical_stream.c -lpq -o $@
 
 clean:
