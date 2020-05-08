@@ -13,6 +13,10 @@
 #include <sys/select.h>
 #include <getopt.h>
 
+#define SQLSTATE_ERRCODE_OBJECT_IN_USE "55006"
+#define SQLSTATE_ERRCODE_UNDEFINED_OBJECT "42704"
+#define SQLSTATE_ERRCODE_DUPLICATE_OBJECT "42710"
+
 struct ConfigParams {
     int count;
     const char** keys;
@@ -25,7 +29,7 @@ struct QueryBuffer {
     size_t bufsiz;
 };
 
-static bool sig_abort_req = false;
+static volatile sig_atomic_t sig_abort_req = false;
 
 static int cfg_cmd_fd = STDIN_FILENO;
 static int cfg_out_fd = STDOUT_FILENO;
@@ -33,11 +37,14 @@ static int s_cmd_fd_set_flags = 0;
 
 static bool cfg_verbose = false;
 static const char* cfg_slot_name = NULL;
-static bool cfg_create_slot = false;
+static const char* cfg_create_slot_plugin = NULL;
+static bool cfg_poll_mode = false;
+static long cfg_poll_duration = 0;
 static struct ConfigParams cfg_plugin_params;
 static struct ConfigParams cfg_pq_params;
 static bool cfg_write_header = false;
 static bool cfg_write_nl = false;
+static bool cfg_fixed_header_length = false;
 static bool cfg_auto_feedback = false;
 static long cfg_standby_message_interval = 5000;
 static long cfg_feedback_interval = 0;
@@ -47,15 +54,26 @@ static char* s_cmdbuf = NULL;
 static size_t s_cmdbf_len = 0;
 
 typedef enum {
-    ECODE_SUCCESS       = 0,
-    ECODE_INVALID_ARGS  = 1,
-    ECODE_PQ_CLOSED     = 2,
-    ECODE_CMD_CLOSED    = 3,
-    ECODE_INIT_FAILED   = 4,
-    ECODE_PQ_ERROR      = 5,
-    ECODE_CMD_ERROR     = 6,
-    ECODE_SYSTEM_ERROR  = 7,
+    ECODE_SUCCESS        = 0,
+    ECODE_INVALID_ARGS   = 1,
+    ECODE_INIT_FAILED    = 2,
+    ECODE_PG_CLOSED      = 3,
+    ECODE_CMD_CLOSED     = 4,
+    ECODE_PG_ERROR       = 5,
+    ECODE_CMD_ERROR      = 6,
+    ECODE_SYSTEM_ERROR   = 7,
+    ECODE_SLOT_NOT_EXIST = 8,
+    ECODE_SLOT_IN_USE    = 9,
 } ExitCode;
+
+static void initConfigParam(struct ConfigParams* params)
+{
+    params->keys = realloc(params->keys, sizeof(char*));
+    params->values = realloc(params->values, sizeof(char*));
+    params->keys[0] = NULL;
+    params->values[0] = NULL;
+    params->count = 0;
+}
 
 static void addConfigParam(struct ConfigParams* params, const char* key, const char* value)
 {
@@ -113,6 +131,16 @@ static void appendQueryBuffer(struct QueryBuffer* qb, const char* str)
     qb->len += len;
 }
 
+static void sigintHandler(int signum)
+{
+    sig_abort_req = true;
+}
+
+static void setupSignalHandlers(void)
+{
+    signal(SIGINT, sigintHandler);
+}
+
 static int writeFully(int fd, struct iovec *iov, int cnt)
 {
     while (cnt > 0) {
@@ -139,15 +167,22 @@ static int writeRow(
         int64_t wal_pos, int64_t wal_end, int64_t send_time,
         const char* data, size_t size)
 {
-    char header_buffer[1+1 + 16+1+16+1 + 10+1 + 1];
+    char header_buffer[31+1];
     struct iovec iov[3];
     int cnt = 0;
 
     if (cfg_write_header) {
-        iov[cnt].iov_base = header_buffer;
-        iov[cnt].iov_len = sprintf(header_buffer, "w %X/%X %lu\n",
+        int header_len = sprintf(header_buffer, "w %X/%X %lu\n",
                 (uint32_t) (wal_pos >> 32), (uint32_t) wal_pos,
                 size + (cfg_write_nl ? 1 : 0));
+        if (cfg_fixed_header_length && header_len < 31) {
+            memset(header_buffer + header_len - 1, ' ', 31 - header_len);
+            header_buffer[30] = '\n';
+            header_buffer[31] = '\0';
+            header_len = 31;
+        }
+        iov[cnt].iov_base = header_buffer;
+        iov[cnt].iov_len = header_len;
         cnt++;
     }
 
@@ -231,7 +266,7 @@ static int processRow(char* copybuf, int buflen,
     }
 }
 
-static int getCmdData()
+static int getCmdData(void)
 {
     if (s_cmd_fd_set_flags) {
         if (fcntl(cfg_cmd_fd, F_SETFL, s_cmd_fd_set_flags) < 0) {
@@ -271,7 +306,7 @@ done:
 }
 
 static int processOneCommand(const char* cmd, size_t len,
-        int64_t* r_next_feedback_lsn)
+        int64_t* r_next_feedback_lsn, bool* r_quit_requested)
 {
     if (len == 0 || cmd[0] == '#') {
         // NOP
@@ -288,11 +323,15 @@ static int processOneCommand(const char* cmd, size_t len,
         *r_next_feedback_lsn = (((int64_t) high32) << 32) | ((int64_t) low32);
         return 0;
     }
+    else if (cmd[0] == 'q') {
+        *r_quit_requested = true;
+        return 0;
+    }
     fprintf(stderr, "Invalid command: %s\n", cmd);
     return -1;
 }
 
-static int processCommands(int64_t* r_next_feedback_lsn)
+static int processCommands(int64_t* r_next_feedback_lsn, bool* r_quit_requested)
 {
     size_t pos = 0;
 
@@ -307,7 +346,7 @@ static int processCommands(int64_t* r_next_feedback_lsn)
         size_t next_cmd_len = next_cmd_end - next_cmd_begin;
 
         int r = processOneCommand(next_cmd_begin, next_cmd_len,
-                r_next_feedback_lsn);
+                r_next_feedback_lsn, r_quit_requested);
         if (r < 0) {
             return -1;
         }
@@ -428,6 +467,7 @@ static ExitCode runLoop(PGconn* conn)
     int64_t last_sent_feedback_lsn = InvalidXLogRecPtr;
     int64_t next_feedback_lsn = InvalidXLogRecPtr;
     int64_t received_lsn = InvalidXLogRecPtr;
+    bool quit_requested = false;
     bool feedback_requested = false;
     char* copybuf = NULL;
     bool pq_ready = true;  // PQgetCopyData must be called first before PQconsumeInput
@@ -445,7 +485,7 @@ static ExitCode runLoop(PGconn* conn)
         if (isFeedbackNeeded(now, feedback_requested, next_feedback_lsn, last_sent_feedback_lsn, last_feedback_sent_at)) {
             int r = sendFeedback(conn, now, received_lsn, next_feedback_lsn);
             if (r < 0) {
-                ecode = ECODE_PQ_ERROR;
+                ecode = ECODE_PG_ERROR;
                 goto error;
             }
             last_feedback_sent_at = now;
@@ -455,7 +495,18 @@ static ExitCode runLoop(PGconn* conn)
 
         // If abort is requested by signal, exit
         if (sig_abort_req) {
-            fprintf(stderr, "Signal received to exit.\n");
+            if (cfg_verbose) {
+                fprintf(stderr, "Signal received to exit.\n");
+            }
+            ecode = ECODE_SUCCESS;
+            goto error;
+        }
+
+        // If quit is requested by a command, exit
+        if (quit_requested) {
+            if (cfg_verbose) {
+                fprintf(stderr, "Quit command received to exit.\n");
+            }
             ecode = ECODE_SUCCESS;
             goto error;
         }
@@ -470,7 +521,7 @@ static ExitCode runLoop(PGconn* conn)
                         &feedback_requested, &received_lsn, &next_feedback_lsn);
                 if (r == -1) {
                     // Protocol error
-                    ecode = ECODE_PQ_ERROR;
+                    ecode = ECODE_PG_ERROR;
                     goto error;
                 }
                 else if (r == -2) {
@@ -482,12 +533,12 @@ static ExitCode runLoop(PGconn* conn)
             }
             else if (buflen == -1) {
                 fprintf(stderr, "Replication stream closed.\n");
-                ecode = ECODE_PQ_CLOSED;
+                ecode = ECODE_PG_CLOSED;
                 goto error;
             }
             else if (buflen == -2) {
                 fprintf(stderr, "Failed to receive replication data: %s\n", PQerrorMessage(conn));
-                ecode = ECODE_PQ_ERROR;
+                ecode = ECODE_PG_ERROR;
                 goto error;
             }
             else if (buflen == 0) {
@@ -503,10 +554,14 @@ static ExitCode runLoop(PGconn* conn)
             // return byte size > 0. Otherwise return 0 immediately.
             int buflen = getCmdData();
             if (buflen > 0) {
-                int r = processCommands(&next_feedback_lsn);
+                int r = processCommands(&next_feedback_lsn, &quit_requested);
                 if (r < 0) {
                     ecode = ECODE_CMD_ERROR;
                     goto error;
+                }
+                if (quit_requested) {
+                    // Send feedback before quit
+                    feedback_requested = true;
                 }
             }
             else if (buflen == -1) {
@@ -534,7 +589,7 @@ static ExitCode runLoop(PGconn* conn)
             int pq_socket = PQsocket(conn);
             if (pq_socket < 0) {
                 fprintf(stderr, "Failed to get a socket of the connection: %s\n", PQerrorMessage(conn));
-                ecode = ECODE_PQ_ERROR;
+                ecode = ECODE_PG_ERROR;
                 goto error;
             }
 
@@ -565,7 +620,7 @@ static ExitCode runLoop(PGconn* conn)
                 if (FD_ISSET(pq_socket, &select_fds)) {
                     if (PQconsumeInput(conn) == 0) {
                         fprintf(stderr, "Failed to receive additional replication data: %s\n", PQerrorMessage(conn));
-                        ecode = ECODE_PQ_ERROR;
+                        ecode = ECODE_PG_ERROR;
                         goto error;
                     }
                     pq_ready = true;
@@ -589,7 +644,7 @@ error:
     return ecode;
 }
 
-static int setNonBlocking()
+static int setNonBlocking(void)
 {
     // Remove non-blocking flag from STDOUT
     int out_flags = fcntl(cfg_out_fd, F_GETFL, 0);
@@ -636,6 +691,9 @@ static int setNonBlocking()
 //
 static int runIdentifySystem(PGconn* conn)
 {
+    // Setup signal handlers
+    setupSignalHandlers();
+
     // Run IDENTIFY_SYSTEM
     if (cfg_verbose) {
         fprintf(stderr, "> IDENTIFY_SYSTEM\n");
@@ -664,50 +722,53 @@ static int runIdentifySystem(PGconn* conn)
 }
 
 ////
-// > START_REPLICATION
+// > CREATE_REPLICATION_SLOT
 //
-static int runStartReplication(PGconn* conn, int64_t start_lsn)
+static int createReplicationSlot(PGconn* conn)
 {
-    char start_lsn_buffer[16*2+1+1];
-    sprintf(start_lsn_buffer, "%X/%X",
-            (uint32_t) (start_lsn >> 32), (uint32_t) start_lsn);
-
     struct QueryBuffer qb;
     initQueryBuffer(&qb);
 
-    appendQueryBuffer(&qb, "START_REPLICATION SLOT \"");
-    appendQueryBuffer(&qb, cfg_slot_name);
-    appendQueryBuffer(&qb, "\" LOGICAL ");
-    appendQueryBuffer(&qb, start_lsn_buffer);
-
-    if (cfg_plugin_params.count > 0) {
-        appendQueryBuffer(&qb, " (");
-        for (int i=0; i < cfg_plugin_params.count; i++) {
-            if (i != 0) {
-                appendQueryBuffer(&qb, ", ");
-            }
-            if (cfg_plugin_params.values[i] != NULL) {
-                appendQueryBuffer(&qb, "\"");
-                appendQueryBuffer(&qb, cfg_plugin_params.keys[i]);
-                appendQueryBuffer(&qb, "\" '");
-                appendQueryBuffer(&qb, cfg_plugin_params.values[i]);
-                appendQueryBuffer(&qb, "'");
-            }
-            else {
-                appendQueryBuffer(&qb, "\"");
-                appendQueryBuffer(&qb, cfg_plugin_params.keys[i]);
-                appendQueryBuffer(&qb, "\"");
-            }
-        }
+    if (cfg_poll_mode) {
+        char* liter_slot_name = PQescapeLiteral(conn, cfg_slot_name, strlen(cfg_slot_name));
+        char* liter_create_slot_plugin = PQescapeLiteral(conn, cfg_create_slot_plugin, strlen(cfg_create_slot_plugin));
+        appendQueryBuffer(&qb, "select * from pg_create_logical_replication_slot(");
+        appendQueryBuffer(&qb, liter_slot_name);
+        appendQueryBuffer(&qb, ", ");
+        appendQueryBuffer(&qb, liter_create_slot_plugin);
         appendQueryBuffer(&qb, ")");
+        PQfreemem(liter_slot_name);
+        PQfreemem(liter_create_slot_plugin);
+    }
+    else {
+        char* ident_slot_name = PQescapeIdentifier(conn, cfg_slot_name, strlen(cfg_slot_name));
+        char* ident_create_slot_plugin = PQescapeIdentifier(conn, cfg_create_slot_plugin, strlen(cfg_create_slot_plugin));
+        appendQueryBuffer(&qb, "CREATE_REPLICATION_SLOT ");
+        appendQueryBuffer(&qb, ident_slot_name);
+        appendQueryBuffer(&qb, " LOGICAL ");
+        appendQueryBuffer(&qb, ident_create_slot_plugin);
+        PQfreemem(ident_slot_name);
+        PQfreemem(ident_create_slot_plugin);
     }
 
     if (cfg_verbose) {
         fprintf(stderr, "> %s\n", qb.str);
     }
+
     PGresult* res = PQexec(conn, qb.str);
-    if (PQresultStatus(res) != PGRES_COPY_BOTH) {
-        fprintf(stderr, "Failed to start replication: %s\n", PQerrorMessage(conn));
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        const char* sqlstate = PQresultErrorField(res, PG_DIAG_SQLSTATE);
+
+        // If slot already exists, return 1.
+        if (strcmp(SQLSTATE_ERRCODE_DUPLICATE_OBJECT, sqlstate) == 0) {
+            destroyQueryBuffer(&qb);
+            PQclear(res);
+            return 1;
+        }
+
+        // Other errors return -1.
+        fprintf(stderr, "Failed to create a replication slot (%s): %s\n",
+                sqlstate, PQerrorMessage(conn));
         destroyQueryBuffer(&qb);
         PQclear(res);
         return -1;
@@ -718,7 +779,92 @@ static int runStartReplication(PGconn* conn, int64_t start_lsn)
     return 0;
 }
 
-static ExitCode run()
+////
+// > START_REPLICATION
+//
+static ExitCode runStartReplication(PGconn* conn, int64_t start_lsn)
+{
+    char start_lsn_buffer[16*2+1+1];
+    sprintf(start_lsn_buffer, "%X/%X",
+            (uint32_t) (start_lsn >> 32), (uint32_t) start_lsn);
+
+    struct QueryBuffer qb;
+    initQueryBuffer(&qb);
+
+    {
+        char* ident_slot_name = PQescapeIdentifier(conn, cfg_slot_name, strlen(cfg_slot_name));
+        appendQueryBuffer(&qb, "START_REPLICATION SLOT ");
+        appendQueryBuffer(&qb, ident_slot_name);
+        appendQueryBuffer(&qb, " LOGICAL ");
+        appendQueryBuffer(&qb, start_lsn_buffer);
+        PQfreemem(ident_slot_name);
+    }
+
+    if (cfg_plugin_params.count > 0) {
+        appendQueryBuffer(&qb, " (");
+        for (int i=0; i < cfg_plugin_params.count; i++) {
+            if (i != 0) {
+                appendQueryBuffer(&qb, ", ");
+            }
+            if (cfg_plugin_params.values[i] != NULL) {
+                char* ident_key = PQescapeIdentifier(conn, cfg_plugin_params.keys[i], strlen(cfg_plugin_params.keys[i]));
+                char* liter_value = PQescapeLiteral(conn, cfg_plugin_params.values[i], strlen(cfg_plugin_params.values[i]));
+                appendQueryBuffer(&qb, ident_key);
+                appendQueryBuffer(&qb, " ");
+                appendQueryBuffer(&qb, liter_value);
+                PQfreemem(ident_key);
+                PQfreemem(liter_value);
+            }
+            else {
+                char* ident_key = PQescapeIdentifier(conn, cfg_plugin_params.keys[i], strlen(cfg_plugin_params.keys[i]));
+                appendQueryBuffer(&qb, ident_key);
+                PQfreemem(ident_key);
+            }
+        }
+        appendQueryBuffer(&qb, ")");
+    }
+
+    if (cfg_verbose) {
+        fprintf(stderr, "> %s\n", qb.str);
+    }
+
+    PGresult* res = PQexec(conn, qb.str);
+    if (PQresultStatus(res) != PGRES_COPY_BOTH) {
+        const char* sqlstate = PQresultErrorField(res, PG_DIAG_SQLSTATE);
+
+        // If slot is in use by another client, return ECODE_SLOT_IN_USE.
+        if (strcmp(SQLSTATE_ERRCODE_OBJECT_IN_USE, sqlstate) == 0) {
+            if (cfg_verbose) {
+                fprintf(stderr, "Replication slot is in use: %s\n", PQerrorMessage(conn));
+            }
+            destroyQueryBuffer(&qb);
+            PQclear(res);
+            return ECODE_SLOT_IN_USE;
+        }
+        // If slot does not exist, return ECODE_SLOT_NOT_EXIST.
+        else if (strcmp(SQLSTATE_ERRCODE_UNDEFINED_OBJECT, sqlstate) == 0) {
+            if (cfg_verbose) {
+                fprintf(stderr, "Replication does not exist: %s\n", PQerrorMessage(conn));
+            }
+            destroyQueryBuffer(&qb);
+            PQclear(res);
+            return ECODE_SLOT_NOT_EXIST;
+        }
+
+        // Otherwise, return ECODE_INIT_FAILED.
+        fprintf(stderr, "Failed to start replication (%s): %s\n",
+                sqlstate, PQerrorMessage(conn));
+        destroyQueryBuffer(&qb);
+        PQclear(res);
+        return ECODE_INIT_FAILED;
+    }
+
+    destroyQueryBuffer(&qb);
+    PQclear(res);
+    return ECODE_SUCCESS;
+}
+
+static ExitCode run(void)
 {
     PGconn* conn = NULL;
     ExitCode ecode;
@@ -734,7 +880,7 @@ static ExitCode run()
         goto done;
     }
 
-    // Establilsh the connection
+    // Establish the connection
     conn = PQconnectdbParams(cfg_pq_params.keys, cfg_pq_params.values, 1);
     if (PQstatus(conn) != CONNECTION_OK) {
         fprintf(stderr, "Connection to database failed: %s\n", PQerrorMessage(conn));
@@ -749,8 +895,17 @@ static ExitCode run()
     }
 
     // Run START_REPLICATION
-    if (runStartReplication(conn, InvalidXLogRecPtr) < 0) {
-        ecode = ECODE_INIT_FAILED;
+    ecode = runStartReplication(conn, InvalidXLogRecPtr);
+    if (cfg_create_slot_plugin != NULL && ecode == ECODE_SLOT_NOT_EXIST) {
+        // If slot doesn't exist and --create-slot is set, create the slot
+        if (createReplicationSlot(conn) < 0) {
+            ecode = ECODE_INIT_FAILED;
+            goto done;
+        }
+        // then retry runStartReplication.
+        ecode = runStartReplication(conn, InvalidXLogRecPtr);
+    }
+    if (ecode != ECODE_SUCCESS) {
         goto done;
     }
 
@@ -758,10 +913,134 @@ static ExitCode run()
     if (cfg_verbose) {
         fprintf(stderr, "Replication started\n");
     }
+
     ecode = runLoop(conn);
 
 done:
     if (conn != NULL) {
+        if (cfg_verbose) {
+            fprintf(stderr, "Closing connection\n");
+        }
+        PQfinish(conn);
+    }
+    return ecode;
+}
+
+static ExitCode runPollLoop(PGconn* conn)
+{
+    ExitCode ecode;
+
+    struct QueryBuffer qb;
+    initQueryBuffer(&qb);
+
+    {
+        char* liter_slot_name = PQescapeLiteral(conn, cfg_slot_name, strlen(cfg_slot_name));
+        appendQueryBuffer(&qb, "select active from pg_replication_slots where slot_name = ");
+        appendQueryBuffer(&qb, liter_slot_name);
+        PQfreemem(liter_slot_name);
+    }
+
+    if (cfg_verbose) {
+        fprintf(stderr, "> %s\n", qb.str);
+    }
+
+    int64_t started_at = feGetCurrentTimestamp();
+    while (true) {
+        // Select from pg_replication_slots
+        PGresult* res = PQexec(conn, qb.str);
+        if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+            fprintf(stderr, "Failed to check status of replication slot: %s\n", PQerrorMessage(conn));
+            PQclear(res);
+            ecode = ECODE_INIT_FAILED;
+            goto done;
+        }
+
+        // Check results
+        bool ready = false;
+        bool exist = false;
+        for (int r = 0; r < PQntuples(res); r++) {
+            exist = true;
+            int fields = PQnfields(res);
+            for (int c = 0; c < fields; c++) {
+                if (strcmp(PQfname(res, c), "active") == 0 &&
+                        strcmp(PQgetvalue(res, r, c), "f") == 0) {
+                    ready = true;
+                }
+            }
+        }
+        PQclear(res);
+
+        if (ready) {
+            // Slot is ready. Finish polling.
+            ecode = ECODE_SUCCESS;
+            goto done;
+        }
+        else if (!exist && cfg_create_slot_plugin != NULL) {
+            // Slot doesn't exist and --create-slot is set. Create the slot.
+            if (createReplicationSlot(conn) < 0) {
+                ecode = ECODE_INIT_FAILED;
+                goto done;
+            }
+            // Re-check status immediately
+            continue;
+        }
+
+        // If timeout, exit.
+        int64_t now = feGetCurrentTimestamp();
+        if (feTimestampDifferenceExceeds(started_at, now, cfg_poll_duration)) {
+            if (exist) {
+                ecode = ECODE_SLOT_IN_USE;
+                fprintf(stderr, "Slot is in use. Timeout.\n");
+            }
+            else {
+                ecode = ECODE_SLOT_NOT_EXIST;
+                fprintf(stderr, "Slot doesn't exist. Timeout.\n");
+            }
+            goto done;
+        }
+
+        // Otherwise, wait.
+        if (cfg_standby_message_interval > 0) {
+            struct timespec sp;
+            sp.tv_sec = (cfg_standby_message_interval / 1000);
+            sp.tv_nsec = (cfg_standby_message_interval % 1000) * 1000 * 1000 * 1000;
+            if (cfg_verbose) {
+                if (exist) {
+                    fprintf(stderr, "Slot is in use. Sleeping %.3f seconds.\n", (cfg_standby_message_interval / 1000.0));
+                }
+                else {
+                    fprintf(stderr, "Slot doesn't exist. Sleeping %.3f seconds.\n", (cfg_standby_message_interval / 1000.0));
+                }
+            }
+            nanosleep(&sp, NULL);
+        }
+    }
+
+done:
+    destroyQueryBuffer(&qb);
+    return ecode;
+}
+
+static ExitCode runPoll(void)
+{
+    PGconn* conn = NULL;
+    ExitCode ecode;
+
+    // Establish the connection
+    conn = PQconnectdbParams(cfg_pq_params.keys, cfg_pq_params.values, 1);
+    if (PQstatus(conn) != CONNECTION_OK) {
+        fprintf(stderr, "Connection to database failed: %s\n", PQerrorMessage(conn));
+        ecode = ECODE_INIT_FAILED;
+        goto done;
+    }
+
+    ecode = runPollLoop(conn);
+
+done:
+    if (conn != NULL) {
+        if (cfg_verbose) {
+            fprintf(stderr, "Closing connection\n");
+        }
         PQfinish(conn);
     }
     return ecode;
@@ -775,11 +1054,15 @@ static void showUsage(void)
     printf("  -v, --verbose                show verbose messages\n");
     printf("  -S, --slot NAME              name of the logical replication slot\n");
     printf("  -o, --option KEY[=VALUE]     pass option NAME with optional value VALUE to the replication slot\n");
+    printf("  -c, --create-slot NAME       create a logical replication slot if not exist using given plugin\n");
+    printf("  -L, --poll-mode SECS         check availability of the replication slot at most given amount of time\n");
+    printf("                               and then exit without outputting data\n");
     printf("  -D, --fd INTEGER             use the given file descriptor number instead of 1 (stdout)\n");
     printf("  -F, --feedback-interval SEC  maximum delay to send feedback to the replication slot (default: %.3f)\n", (cfg_feedback_interval / 1000.0));
     printf("  -s, --status-interval SECS   time between status messages sent to the server (default: %.3f)\n", (cfg_standby_message_interval / 1000.0));
     printf("  -A, --auto-feedback          send feedback automatically\n");
     printf("  -H, --write-header           write a header line every before a record\n");
+    printf("  -X, --fixed-length-header    pad a header by spaces so that a header length becomes always 31 bytes\n");
     printf("  -N, --write-nl               write a new line character every after a record\n");
     printf("  -j, --wal2json1              equivalent to -o format-version=1 -o include-lsn=true\n");
     printf("  -J  --wal2json2              equivalent to -o format-version=2 --write-header\n");
@@ -793,19 +1076,25 @@ static void showUsage(void)
 
 int main(int argc, char** argv)
 {
+    initConfigParam(&cfg_pq_params);
+    initConfigParam(&cfg_plugin_params);
+
     struct option longopts[] = {
         { "help",               no_argument,       NULL, '?' },
         { "verbose",            no_argument,       NULL, 'v' },
         { "slot",               required_argument, NULL, 'S' },
         { "option",             required_argument, NULL, 'o' },
+        { "create-slot",        required_argument, NULL, 'c' },
+        { "poll-mode",          required_argument, NULL, 'L' },
         { "fd",                 required_argument, NULL, 'D' },
         { "feedback-interval",  required_argument, NULL, 'F' },
         { "status-interval",    required_argument, NULL, 's' },
         { "auto-feedback",      no_argument,       NULL, 'A' },
         { "write-header",       no_argument,       NULL, 'H' },
+        { "fixed-length-header",no_argument,       NULL, 'X' },
         { "write-nl",           no_argument,       NULL, 'N' },
         { "wal2json1",          no_argument,       NULL, 'j' },
-        { "wal2json2"      ,    no_argument,       NULL, 'J' },
+        { "wal2json2",          no_argument,       NULL, 'J' },
         { "dbname",             required_argument, NULL, 'd' },
         { "host",               required_argument, NULL, 'h' },
         { "port",               required_argument, NULL, 'p' },
@@ -816,7 +1105,7 @@ int main(int argc, char** argv)
 
     int opt;
     int longindex;
-    while ((opt = getopt_long(argc, argv, "?vS:o:D:F:s:AHNjJd:h:p:U:m:", longopts, &longindex)) != -1) {
+    while ((opt = getopt_long(argc, argv, "?vS:o:c:L:D:F:s:AHXNjJd:h:p:U:m:", longopts, &longindex)) != -1) {
         switch (opt) {
         case '?':
             showUsage();
@@ -841,11 +1130,30 @@ int main(int argc, char** argv)
                 cfg_out_fd = (int) v;
             }
             break;
+        case 'c':
+            cfg_create_slot_plugin = optarg;
+            break;
+        case 'L':
+            cfg_poll_mode = true;
+            {
+                char* endpos = NULL;
+                double v = strtod(optarg, &endpos);
+                cfg_poll_duration = (int) (v * 1000);
+                if (cfg_poll_duration < 0L || endpos != optarg + strlen(optarg)) {
+                    fprintf(stderr, "Invalid -L,--poll-mode option: %s\n", optarg);
+                    return ECODE_INVALID_ARGS;
+                }
+            }
+            break;
+            break;
         case 'A':
             cfg_auto_feedback = true;
             break;
         case 'H':
             cfg_write_header = true;
+            break;
+        case 'X':
+            cfg_fixed_header_length = true;
             break;
         case 'F':
             {
@@ -914,9 +1222,16 @@ int main(int argc, char** argv)
     if (cfg_verbose) {
         fprintf(stderr, "Options:\n");
         fprintf(stderr, "  slot=%s\n", cfg_slot_name);
-        fprintf(stderr, "  create-slot=%s\n", cfg_create_slot ? "true" : "false");
+        fprintf(stderr, "  create-slot=%s\n", (cfg_create_slot_plugin == NULL ? "" : cfg_create_slot_plugin));
+        if (cfg_poll_mode) {
+            fprintf(stderr, "  poll-mode=%.3f\n", (cfg_poll_duration / 1000.0));
+        }
+        else {
+            fprintf(stderr, "  poll-mode=\n");
+        }
         fprintf(stderr, "  feedback-interval=%.3f\n", (cfg_feedback_interval / 1000.0));
         fprintf(stderr, "  status-interval=%.3f\n", (cfg_standby_message_interval / 1000.0));
+        fprintf(stderr, "  output-fd=%d\n", cfg_out_fd);
         fprintf(stderr, "Plugin options:\n");
         for (int i = 0; i < cfg_plugin_params.count; i++) {
             if (cfg_plugin_params.values[i] != NULL) {
@@ -937,12 +1252,19 @@ int main(int argc, char** argv)
         }
     }
 
-    // Setting "replication=database" establishes the connection in
-    // streaming replication mode. This connection uses replication
-    // protocol instead of regular SQL protocol:
-    // https://www.postgresql.org/docs/current/protocol-replication.html
-    addConfigParamArg(&cfg_pq_params, "replication=database");
+    ExitCode ecode;
+    if (cfg_poll_mode) {
+        ecode = runPoll();
+    }
+    else {
+        // Setting "replication=database" establishes the connection in
+        // streaming replication mode. This connection uses replication
+        // protocol instead of regular SQL protocol:
+        // https://www.postgresql.org/docs/current/protocol-replication.html
+        addConfigParamArg(&cfg_pq_params, "replication=database");
 
-    ExitCode ecode = run();
+        ecode = run();
+    }
+
     return ecode;
 }
