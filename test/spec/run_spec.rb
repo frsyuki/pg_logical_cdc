@@ -128,7 +128,6 @@ RSpec.describe "run" do
         h = c.stdout.gets
         r = c.stdout.gets
         j = JSON.parse(r)
-        j = JSON.parse(r)
         expect(j["action"]).to eq("I")
         expect(j["table"]).to eq(table1)
         expect(j["columns"]).to eq([
@@ -186,7 +185,6 @@ RSpec.describe "run" do
       2.times do |i|
         h = c.stdout.gets
         r = c.stdout.gets
-        j = JSON.parse(r)
         j = JSON.parse(r)
         expect(j["action"]).to eq("I")
         expect(j["table"]).to eq(table1)
@@ -249,7 +247,6 @@ RSpec.describe "run" do
       h = c.stdout.gets
       r = c.stdout.gets
       j = JSON.parse(r)
-      j = JSON.parse(r)
       expect(j["action"]).to eq("I")
       expect(j["table"]).to eq(table2)
       expect(j["columns"]).to eq([
@@ -265,5 +262,140 @@ RSpec.describe "run" do
       j = JSON.parse(r)
       expect(j["action"]).to eq("C")
     end
+  end
+
+  it "resumes" do
+    cmd(slot_name, "-N --wal2json2") do |c|
+      pg_exec "insert into #{table1} (name) values ('n1'), ('n2')"
+
+      # Begin ("B")
+      h = c.stdout.gets
+      r = c.stdout.gets
+      j = JSON.parse(r)
+      expect(j["action"]).to eq("B")
+
+      # Insert ("I")
+      h = c.stdout.gets
+      r = c.stdout.gets
+      j = JSON.parse(r)
+      expect(j["action"]).to eq("I")
+    end
+
+    # Restart without sending feedback
+
+    cmd(slot_name, "-N --wal2json2") do |c|
+      pg_exec "insert into #{table1} (name) values ('n1'), ('n2')"
+
+      # Begin ("B")
+      h = c.stdout.gets
+      r = c.stdout.gets
+      j = JSON.parse(r)
+      expect(j["action"]).to eq("B")
+
+      # Insert ("I") x2
+      2.times do |i|
+        h = c.stdout.gets
+        r = c.stdout.gets
+        j = JSON.parse(r)
+        expect(j["action"]).to eq("I")
+        expect(j["table"]).to eq(table1)
+        expect(j["columns"]).to eq([
+          {"name"=>"id", "type"=>"bigint", "value"=>(i + 1)},
+          {"name"=>"name", "type"=>"text", "value"=>"n#{i + 1}"},
+          {"name"=>"extra", "type"=>"bytea", "value"=>nil}
+        ])
+      end
+
+      # Commit ("C")
+      h = c.stdout.gets
+      r = c.stdout.gets
+      j = JSON.parse(r)
+      expect(j["action"]).to eq("C")
+    end
+  end
+
+  it "sends feedback" do
+    lsn_before_feedback = nil
+    lsn_after_feedback = nil
+
+    stat = cmd(slot_name, "-N --wal2json2 -v") do |c|
+      pg_exec "insert into #{table1} (name) values ('n1')"
+      pg_exec "delete from #{table1} where name = 'n1'"
+
+      # Begin ("B")
+      h = c.stdout.gets
+      r = c.stdout.gets
+      j = JSON.parse(r)
+      expect(j["action"]).to eq("B")
+
+      # Insert ("I")
+      h = c.stdout.gets
+      r = c.stdout.gets
+      j = JSON.parse(r)
+      expect(j["action"]).to eq("I")
+
+      # Commit ("C")
+      h = c.stdout.gets
+      r = c.stdout.gets
+      j = JSON.parse(r)
+      expect(j["action"]).to eq("C")
+
+      expect(h).to match(HEADER_REGEXP)
+      lsn_before_ic = HEADER_REGEXP.match(h)[:lsn]
+
+      # Send feedback
+      r = pg_exec "select * from pg_replication_slots where slot_name = '#{slot_name}'"
+      lsn_before_feedback = r[0]["confirmed_flush_lsn"]
+      c.stdin.puts "F #{lsn_before_ic}"
+      lsn_after_feedback = lsn_before_ic
+
+      # Send quit
+      c.stdin.puts "q"
+
+      # Wait for completion
+      c.stdout.read
+    end
+
+    # Exit code is SUCCESS
+    expect(stat.exitstatus).to eq(0)
+
+    # confirmed_flush_lsn should become the lsn sent
+    r = pg_exec "select * from pg_replication_slots where slot_name = '#{slot_name}'"
+    expect(lsn_before_feedback).not_to eq(lsn_after_feedback)
+    expect(r[0]["confirmed_flush_lsn"]).to eq(lsn_after_feedback)
+
+    cmd(slot_name, "-N --wal2json2") do |c|
+      pg_exec "insert into #{table1} (name) values ('n1'), ('n2')"
+
+      # Begin ("B")
+      h = c.stdout.gets
+      r = c.stdout.gets
+      j = JSON.parse(r)
+      expect(j["action"]).to eq("B")
+
+      # Delete ("D")
+      h = c.stdout.gets
+      r = c.stdout.gets
+      j = JSON.parse(r)
+      expect(j["action"]).to eq("D")
+
+      # Commit ("C")
+      h = c.stdout.gets
+      r = c.stdout.gets
+      j = JSON.parse(r)
+      expect(j["action"]).to eq("C")
+    end
+  end
+
+  it "returns CMD_CLOSED when stdin is closed" do
+    stat = cmd(slot_name, "-N --wal2json2 -v") do |c|
+      h = c.stdin.close
+
+      # Wait for completion
+      c.stdout.read
+    end
+
+    # Exit code is CMD_CLOSED.
+    expect(stat.exitstatus).to eq(4)
   end
 end
