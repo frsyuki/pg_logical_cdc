@@ -456,7 +456,7 @@ static ExitCode runLoop(PGconn* conn)
     bool quit_requested = false;
     bool feedback_requested = false;
     char* copybuf = NULL;
-    bool pq_ready = true;  // PQgetCopyData must be called first before PQconsumeInput
+    bool pq_ready = false;
     bool cmd_ready = false;
 
     while (true) {
@@ -499,14 +499,21 @@ static ExitCode runLoop(PGconn* conn)
 
         // If PQgetCopyData is ready to call, try to receive a row
         if (pq_ready) {
-            int skip_select = 5;
-            bool row_received = false;
+            if (PQconsumeInput(conn) == 0) {
+                fprintf(stderr, "Failed to receive additional replication data: %s\n", PQerrorMessage(conn));
+                ecode = ECODE_PG_ERROR;
+                goto error;
+            }
+            // call select(2) only when PQgetCopyData doesn't return 0 after
+            // PQconsumeInput. pq_ready is set to true if PQgetCopyData
+            // returns 0.
+            pq_ready = false;
+
             while (true) {
                 // PQgetCopyData with async=true mode receives a complete row
                 // and return byte size > 0. Otherwise return 0 immediately.
                 int buflen = PQgetCopyData(conn, &copybuf, true);
                 if (buflen > 0) {
-                    row_received = true;
                     int r = processRow(copybuf, buflen,
                             &feedback_requested, &received_lsn, &next_feedback_lsn);
                     if (r == -1) {
@@ -519,37 +526,23 @@ static ExitCode runLoop(PGconn* conn)
                         ecode = ECODE_SYSTEM_ERROR;
                         goto error;
                     }
-                    // continoue to PQgetCopyData call again.
-                    // do not reset pq_ready so that PQgetCopyData is called until it
-                    // returns 0.
-                    continue;
+                    pq_ready = true;
+                    // continoue to PQgetCopyData call again. Call PQgetCopyData until
+                    // it returns 0, then call PQconsumeInput.
+                }
+                else if (buflen == 0) {
+                    // end pq_ready
+                    break;
                 }
                 else if (buflen == -1) {
                     fprintf(stderr, "Replication stream closed.\n");
                     ecode = ECODE_PG_CLOSED;
                     goto error;
                 }
-                else if (buflen == -2) {
+                else {  // buflen < -1
                     fprintf(stderr, "Failed to receive replication data: %s\n", PQerrorMessage(conn));
                     ecode = ECODE_PG_ERROR;
                     goto error;
-                }
-                else if (buflen == 0) {
-                    if (skip_select > 0 && row_received) {
-                        // Skip select(2) for optimization at most
-                        // skip_select number of times. Focus on
-                        // PQgetCopyData + PQconsumeInput loop.
-                        row_received = false;
-                        skip_select--;
-                        if (PQconsumeInput(conn) == 0) {
-                            fprintf(stderr, "Failed to receive additional replication data: %s\n", PQerrorMessage(conn));
-                            ecode = ECODE_PG_ERROR;
-                            goto error;
-                        }
-                        continue;
-                    }
-                    pq_ready = false;
-                    break;
                 }
             }
         }
@@ -569,23 +562,21 @@ static ExitCode runLoop(PGconn* conn)
                     // Send feedback before quit
                     feedback_requested = true;
                 }
-                // OK
+                // end cmd_ready
             }
-            else if (buflen == -1) {
-                perror("Failed to read STDIN");
-                ecode = ECODE_CMD_ERROR;
-                goto error;
+            else if (buflen == 0) {
+                cmd_ready = false;
             }
             else if (buflen == -2) {
                 fprintf(stderr, "STDIN closed.\n");
                 ecode = ECODE_CMD_CLOSED;
                 goto error;
             }
-            else if (buflen == 0) {
-                cmd_ready = false;
+            else {  // buflen < 0
+                perror("Failed to read STDIN");
+                ecode = ECODE_CMD_ERROR;
+                goto error;
             }
-            // do not reset cmd_ready so that getCmdData is called until it
-            // returns 0.
         }
 
         // If pq_ready=false (last PQgetCopyData call returned 0)

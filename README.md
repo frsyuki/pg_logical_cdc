@@ -28,7 +28,6 @@ Options:
   -s, --status-interval SECS   time between status messages sent to the server (default: 1.000)
   -A, --auto-feedback          send feedback automatically
   -H, --write-header           write a header line every before a record
-  -X, --fixed-length-header    pad a header by spaces so that a header length becomes always 31 bytes
   -N, --write-nl               write a new line character every after a record
   -j, --wal2json1              equivalent to -o format-version=1 -o include-lsn=true -P wal2json
   -J  --wal2json2              equivalent to -o format-version=2 --write-header -P wal2json
@@ -106,14 +105,12 @@ If you give `--write-header` option, pg_logical_stream dumps a record with a hea
 Format of a header is:
 
 ```
-w <LSN> <LENGTH>[PADDING]\n
+w <LSN> <LENGTH>\n
 ```
 
 * `<LSN>` is the offset of the record. Format of a LSN is "%X/%X" (slash-separated two integers in hex format).
 
 * `<LENGTH>` is the length of a change record followed by the header.
-
-* If --fixed-length-header is set, `[PADDING]` is filled with space characters (' ') so that length of a header including \n character is always 31 bytes.
 
 * `\n` is a new-line character.
 
