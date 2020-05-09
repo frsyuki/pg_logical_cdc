@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <limits.h>
+#include <stdio.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
@@ -16,6 +17,9 @@
 #define SQLSTATE_ERRCODE_OBJECT_IN_USE "55006"
 #define SQLSTATE_ERRCODE_UNDEFINED_OBJECT "42704"
 #define SQLSTATE_ERRCODE_DUPLICATE_OBJECT "42710"
+
+#define OUT_BUFSIZ (32*1024)
+#define CMD_BUFSIZ (4096)
 
 struct ConfigParams {
     int count;
@@ -34,6 +38,7 @@ static volatile sig_atomic_t sig_abort_req = false;
 static int cfg_cmd_fd = STDIN_FILENO;
 static int cfg_out_fd = STDOUT_FILENO;
 static int s_cmd_fd_set_flags = 0;
+static FILE* s_out_file = NULL;
 
 static bool cfg_verbose = false;
 static const char* cfg_slot_name = NULL;
@@ -48,14 +53,12 @@ static long cfg_poll_duration = 0;
 static long cfg_poll_interval = 1000;
 
 static bool cfg_write_header = false;
-static bool cfg_fixed_header_length = false;
 static bool cfg_write_nl = false;
 static bool cfg_auto_feedback = false;
 
 static long cfg_standby_message_interval = 5000;
 static long cfg_feedback_interval = 0;
 
-static const size_t CMDBUF_SIZE = 4096;
 static char* s_cmdbuf = NULL;
 static size_t s_cmdbf_len = 0;
 
@@ -147,65 +150,42 @@ static void setupSignalHandlers(void)
     signal(SIGINT, sigintHandler);
 }
 
-static int writeFully(int fd, struct iovec *iov, int cnt)
-{
-    while (cnt > 0) {
-        ssize_t r = writev(fd, iov, cnt);
-        if (r < 0) {
-            return -1;
-        }
-        while (r > 0) {
-            if (iov[0].iov_len <= r) {
-                r -= iov[0].iov_len;
-                iov++;
-                cnt--;
-            }
-            else {
-                iov[0].iov_len -= r;
-                break;
-            }
-        }
-    }
-    return 0;
-}
-
 static int writeRow(
         int64_t wal_pos, int64_t wal_end, int64_t send_time,
         const char* data, size_t size)
 {
-    char header_buffer[31+1];
-    struct iovec iov[3];
-    int cnt = 0;
+    int r;
 
     if (cfg_write_header) {
-        int header_len = sprintf(header_buffer, "w %X/%X %lu\n",
+        r = fprintf(s_out_file, "w %X/%X %lu\n",
                 (uint32_t) (wal_pos >> 32), (uint32_t) wal_pos,
                 size + (cfg_write_nl ? 1 : 0));
-        if (cfg_fixed_header_length && header_len < 31) {
-            memset(header_buffer + header_len - 1, ' ', 31 - header_len);
-            header_buffer[30] = '\n';
-            header_buffer[31] = '\0';
-            header_len = 31;
+        if (r < 0) {
+            return -1;
         }
-        iov[cnt].iov_base = header_buffer;
-        iov[cnt].iov_len = header_len;
-        cnt++;
     }
 
-    iov[cnt].iov_base = (void*) data;
-    iov[cnt].iov_len = size;
-    cnt++;
-
-    if (cfg_write_nl) {
-        iov[cnt].iov_base = "\n";
-        iov[cnt].iov_len = 1;
-        cnt++;
-    }
-
-    if (writeFully(cfg_out_fd, iov, cnt) < 0) {
+    r = fwrite(data, 1, size, s_out_file);
+    if (r < size) {
         return -1;
     }
 
+    if (cfg_write_nl) {
+        r = fputc('\n', s_out_file);
+        if (r == EOF) {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int flushOut()
+{
+    int r = fflush(s_out_file);
+    if (r == EOF) {
+        return -1;
+    }
     return 0;
 }
 
@@ -281,7 +261,7 @@ static int getCmdData(void)
     }
 
     int retval;
-    int len = read(cfg_cmd_fd, s_cmdbuf + s_cmdbf_len, CMDBUF_SIZE - s_cmdbf_len);
+    int len = read(cfg_cmd_fd, s_cmdbuf + s_cmdbf_len, CMD_BUFSIZ - s_cmdbf_len);
     if (len < 0) {
         if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK) {
             retval = 0;  // not ready to read
@@ -519,39 +499,59 @@ static ExitCode runLoop(PGconn* conn)
 
         // If PQgetCopyData is ready to call, try to receive a row
         if (pq_ready) {
-            // PQgetCopyData with async=true mode receives a complete row
-            // and return byte size > 0. Otherwise return 0 immediately.
-            int buflen = PQgetCopyData(conn, &copybuf, true);
-            if (buflen > 0) {
-                int r = processRow(copybuf, buflen,
-                        &feedback_requested, &received_lsn, &next_feedback_lsn);
-                if (r == -1) {
-                    // Protocol error
+            int skip_select = 5;
+            bool row_received = false;
+            while (true) {
+                // PQgetCopyData with async=true mode receives a complete row
+                // and return byte size > 0. Otherwise return 0 immediately.
+                int buflen = PQgetCopyData(conn, &copybuf, true);
+                if (buflen > 0) {
+                    row_received = true;
+                    int r = processRow(copybuf, buflen,
+                            &feedback_requested, &received_lsn, &next_feedback_lsn);
+                    if (r == -1) {
+                        // Protocol error
+                        ecode = ECODE_PG_ERROR;
+                        goto error;
+                    }
+                    else if (r == -2) {
+                        // Failed to write output
+                        ecode = ECODE_SYSTEM_ERROR;
+                        goto error;
+                    }
+                    // continoue to PQgetCopyData call again.
+                    // do not reset pq_ready so that PQgetCopyData is called until it
+                    // returns 0.
+                    continue;
+                }
+                else if (buflen == -1) {
+                    fprintf(stderr, "Replication stream closed.\n");
+                    ecode = ECODE_PG_CLOSED;
+                    goto error;
+                }
+                else if (buflen == -2) {
+                    fprintf(stderr, "Failed to receive replication data: %s\n", PQerrorMessage(conn));
                     ecode = ECODE_PG_ERROR;
                     goto error;
                 }
-                else if (r == -2) {
-                    // Failed to write output
-                    ecode = ECODE_SYSTEM_ERROR;
-                    goto error;
+                else if (buflen == 0) {
+                    if (skip_select > 0 && row_received) {
+                        // Skip select(2) for optimization at most
+                        // skip_select number of times. Focus on
+                        // PQgetCopyData + PQconsumeInput loop.
+                        row_received = false;
+                        skip_select--;
+                        if (PQconsumeInput(conn) == 0) {
+                            fprintf(stderr, "Failed to receive additional replication data: %s\n", PQerrorMessage(conn));
+                            ecode = ECODE_PG_ERROR;
+                            goto error;
+                        }
+                        continue;
+                    }
+                    pq_ready = false;
+                    break;
                 }
-                // OK
             }
-            else if (buflen == -1) {
-                fprintf(stderr, "Replication stream closed.\n");
-                ecode = ECODE_PG_CLOSED;
-                goto error;
-            }
-            else if (buflen == -2) {
-                fprintf(stderr, "Failed to receive replication data: %s\n", PQerrorMessage(conn));
-                ecode = ECODE_PG_ERROR;
-                goto error;
-            }
-            else if (buflen == 0) {
-                pq_ready = false;
-            }
-            // do not reset pq_ready so that PQgetCopyData is called until it
-            // returns 0.
         }
 
         // If cmd is ready to receive, try to receive commands
@@ -569,6 +569,7 @@ static ExitCode runLoop(PGconn* conn)
                     // Send feedback before quit
                     feedback_requested = true;
                 }
+                // OK
             }
             else if (buflen == -1) {
                 perror("Failed to read STDIN");
@@ -591,6 +592,13 @@ static ExitCode runLoop(PGconn* conn)
         // or cmd_ready=false (last getCmdData call returned 0),
         // then use select() to wait for additional data.
         if (!pq_ready && !cmd_ready && !feedback_requested) {
+            // out-of-bound flush before blocking operation
+            if (flushOut() < 0) {
+                perror("failed to write data to output");
+                ecode = ECODE_SYSTEM_ERROR;
+                goto error;
+            }
+
             fd_set select_fds;
             int pq_socket = PQsocket(conn);
             if (pq_socket < 0) {
@@ -646,6 +654,8 @@ error:
         PQfreemem(copybuf);
         copybuf = NULL;
     }
+
+    flushOut();
 
     return ecode;
 }
@@ -875,9 +885,13 @@ static ExitCode run(void)
     PGconn* conn = NULL;
     ExitCode ecode;
 
-    // Allocate input memory
-    s_cmdbuf = malloc(CMDBUF_SIZE);
+    // Allocate input buffer
+    s_cmdbuf = malloc(CMD_BUFSIZ);
     s_cmdbf_len = 0;
+
+    // Allocate output buffer
+    s_out_file = fdopen(cfg_out_fd, "a");
+    setvbuf(s_out_file, NULL, _IOFBF, OUT_BUFSIZ);  // ignore errors and use default
 
     // Set non-blocking mode to command input file descriptor
     if (setNonBlocking() < 0) {
@@ -1075,7 +1089,6 @@ static void showUsage(void)
     printf("  -s, --status-interval SECS   time between status messages sent to the server (default: %.3f)\n", (cfg_standby_message_interval / 1000.0));
     printf("  -A, --auto-feedback          send feedback automatically\n");
     printf("  -H, --write-header           write a header line every before a record\n");
-    printf("  -X, --fixed-length-header    pad a header by spaces so that a header length becomes always 31 bytes\n");
     printf("  -N, --write-nl               write a new line character every after a record\n");
     printf("  -j, --wal2json1              equivalent to -o format-version=1 -o include-lsn=true -P wal2json\n");
     printf("  -J  --wal2json2              equivalent to -o format-version=2 --write-header -P wal2json\n");
@@ -1121,7 +1134,6 @@ int main(int argc, char** argv)
         { "status-interval",    required_argument, NULL, 's' },
         { "auto-feedback",      no_argument,       NULL, 'A' },
         { "write-header",       no_argument,       NULL, 'H' },
-        { "fixed-length-header",no_argument,       NULL, 'X' },
         { "write-nl",           no_argument,       NULL, 'N' },
         { "wal2json1",          no_argument,       NULL, 'j' },
         { "wal2json2",          no_argument,       NULL, 'J' },
@@ -1138,7 +1150,7 @@ int main(int argc, char** argv)
 
     int opt;
     int longindex;
-    while ((opt = getopt_long(argc, argv, "?vS:o:cLD:F:s:AHXNjJP:u:i:d:h:p:U:m:", longopts, &longindex)) != -1) {
+    while ((opt = getopt_long(argc, argv, "?vS:o:cLD:F:s:AHNjJP:u:i:d:h:p:U:m:", longopts, &longindex)) != -1) {
         switch (opt) {
         case '?':
             showUsage();
@@ -1187,9 +1199,6 @@ int main(int argc, char** argv)
             break;
         case 'H':
             cfg_write_header = true;
-            break;
-        case 'X':
-            cfg_fixed_header_length = true;
             break;
         case 'F':
             if (parseInterval(optarg,"-F,--feedback-interval", &cfg_feedback_interval) < 0) {
