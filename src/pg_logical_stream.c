@@ -37,15 +37,21 @@ static int s_cmd_fd_set_flags = 0;
 
 static bool cfg_verbose = false;
 static const char* cfg_slot_name = NULL;
-static const char* cfg_create_slot_plugin = NULL;
+static struct ConfigParams cfg_pq_params;
+
+static bool cfg_create_slot = false;
+static const char* cfg_create_slot_plugin = "test_decoding";
+static struct ConfigParams cfg_plugin_params;
+
 static bool cfg_poll_mode = false;
 static long cfg_poll_duration = 0;
-static struct ConfigParams cfg_plugin_params;
-static struct ConfigParams cfg_pq_params;
+static long cfg_poll_interval = 1000;
+
 static bool cfg_write_header = false;
-static bool cfg_write_nl = false;
 static bool cfg_fixed_header_length = false;
+static bool cfg_write_nl = false;
 static bool cfg_auto_feedback = false;
+
 static long cfg_standby_message_interval = 5000;
 static long cfg_feedback_interval = 0;
 
@@ -896,7 +902,7 @@ static ExitCode run(void)
 
     // Run START_REPLICATION
     ecode = runStartReplication(conn, InvalidXLogRecPtr);
-    if (cfg_create_slot_plugin != NULL && ecode == ECODE_SLOT_NOT_EXIST) {
+    if (cfg_create_slot && ecode == ECODE_SLOT_NOT_EXIST) {
         // If slot doesn't exist and --create-slot is set, create the slot
         if (createReplicationSlot(conn) < 0) {
             ecode = ECODE_INIT_FAILED;
@@ -972,11 +978,17 @@ static ExitCode runPollLoop(PGconn* conn)
 
         if (ready) {
             // Slot is ready. Finish polling.
+            if (cfg_verbose) {
+                fprintf(stderr, "Fond the slot not in use.\n");
+            }
             ecode = ECODE_SUCCESS;
             goto done;
         }
-        else if (!exist && cfg_create_slot_plugin != NULL) {
+        else if (!exist && cfg_create_slot) {
             // Slot doesn't exist and --create-slot is set. Create the slot.
+            if (cfg_verbose) {
+                fprintf(stderr, "Slot doesn't exist.\n");
+            }
             if (createReplicationSlot(conn) < 0) {
                 ecode = ECODE_INIT_FAILED;
                 goto done;
@@ -986,30 +998,32 @@ static ExitCode runPollLoop(PGconn* conn)
         }
 
         // If timeout, exit.
-        int64_t now = feGetCurrentTimestamp();
-        if (feTimestampDifferenceExceeds(started_at, now, cfg_poll_duration)) {
-            if (exist) {
-                ecode = ECODE_SLOT_IN_USE;
-                fprintf(stderr, "Slot is in use. Timeout.\n");
+        if (cfg_poll_duration > 0) {
+            int64_t now = feGetCurrentTimestamp();
+            if (feTimestampDifferenceExceeds(started_at, now, cfg_poll_duration)) {
+                if (exist) {
+                    ecode = ECODE_SLOT_IN_USE;
+                    fprintf(stderr, "Slot is in use. Timeout.\n");
+                }
+                else {
+                    ecode = ECODE_SLOT_NOT_EXIST;
+                    fprintf(stderr, "Slot doesn't exist. Timeout.\n");
+                }
+                goto done;
             }
-            else {
-                ecode = ECODE_SLOT_NOT_EXIST;
-                fprintf(stderr, "Slot doesn't exist. Timeout.\n");
-            }
-            goto done;
         }
 
         // Otherwise, wait.
-        if (cfg_standby_message_interval > 0) {
+        if (cfg_poll_interval > 0) {
             struct timespec sp;
-            sp.tv_sec = (cfg_standby_message_interval / 1000);
-            sp.tv_nsec = (cfg_standby_message_interval % 1000) * 1000 * 1000 * 1000;
+            sp.tv_sec = (cfg_poll_interval / 1000);
+            sp.tv_nsec = (cfg_poll_interval % 1000) * 1000 * 1000 * 1000;
             if (cfg_verbose) {
                 if (exist) {
-                    fprintf(stderr, "Slot is in use. Sleeping %.3f seconds.\n", (cfg_standby_message_interval / 1000.0));
+                    fprintf(stderr, "Slot is in use. Sleeping %.3f seconds.\n", (cfg_poll_interval / 1000.0));
                 }
                 else {
-                    fprintf(stderr, "Slot doesn't exist. Sleeping %.3f seconds.\n", (cfg_standby_message_interval / 1000.0));
+                    fprintf(stderr, "Slot doesn't exist. Sleeping %.3f seconds.\n", (cfg_poll_interval / 1000.0));
                 }
             }
             nanosleep(&sp, NULL);
@@ -1054,9 +1068,8 @@ static void showUsage(void)
     printf("  -v, --verbose                show verbose messages\n");
     printf("  -S, --slot NAME              name of the logical replication slot\n");
     printf("  -o, --option KEY[=VALUE]     pass option NAME with optional value VALUE to the replication slot\n");
-    printf("  -c, --create-slot NAME       create a logical replication slot if not exist using given plugin\n");
-    printf("  -L, --poll-mode SECS         check availability of the replication slot at most given amount of time\n");
-    printf("                               and then exit without outputting data\n");
+    printf("  -c, --create-slot            create a replication slot if not exist using the plugin set to --P option\n");
+    printf("  -L, --poll-mode              check availability of the replication slot then exit\n");
     printf("  -D, --fd INTEGER             use the given file descriptor number instead of 1 (stdout)\n");
     printf("  -F, --feedback-interval SEC  maximum delay to send feedback to the replication slot (default: %.3f)\n", (cfg_feedback_interval / 1000.0));
     printf("  -s, --status-interval SECS   time between status messages sent to the server (default: %.3f)\n", (cfg_standby_message_interval / 1000.0));
@@ -1064,14 +1077,31 @@ static void showUsage(void)
     printf("  -H, --write-header           write a header line every before a record\n");
     printf("  -X, --fixed-length-header    pad a header by spaces so that a header length becomes always 31 bytes\n");
     printf("  -N, --write-nl               write a new line character every after a record\n");
-    printf("  -j, --wal2json1              equivalent to -o format-version=1 -o include-lsn=true\n");
-    printf("  -J  --wal2json2              equivalent to -o format-version=2 --write-header\n");
+    printf("  -j, --wal2json1              equivalent to -o format-version=1 -o include-lsn=true -P wal2json\n");
+    printf("  -J  --wal2json2              equivalent to -o format-version=2 --write-header -P wal2json\n");
+    printf("\nCreate slot options:\n");
+    printf("  -P, --plugin NAME            logical decoder plugin for a new replication slot (default: test_decoding)\n");
+    printf("\nPoll mode options:\n");
+    printf("  -u, --poll-duration SECS     maximum amount of time to wait until slot becomes available (default: no limit)\n");
+    printf("  -i, --poll-interval SECS     interval to check availability of a slot (default: %.3f)\n", (cfg_poll_interval / 1000.0));
     printf("\nConnection options:\n");
     printf("  -d, --dbname DBNAME      database name to connect to\n");
     printf("  -h, --host HOSTNAME      database server host or socket directory\n");
     printf("  -p, --port PORT          database server port\n");
     printf("  -U, --username USERNAME  database user name\n");
     printf("  -m, --param KEY=VALUE    database connection parameter (connect_timeout, application_name, etc.)\n");
+}
+
+static int parseInterval(const char* arg, const char* arg_name, long* r_millis)
+{
+    char* endpos = NULL;
+    double v = strtod(arg, &endpos);
+    *r_millis = (long) (v * 1000);
+    if (*r_millis < 0L || endpos != arg + strlen(arg)) {
+        fprintf(stderr, "Invalid %s option: %s\n", arg_name, arg);
+        return -1;
+    }
+    return 0;
 }
 
 int main(int argc, char** argv)
@@ -1084,8 +1114,8 @@ int main(int argc, char** argv)
         { "verbose",            no_argument,       NULL, 'v' },
         { "slot",               required_argument, NULL, 'S' },
         { "option",             required_argument, NULL, 'o' },
-        { "create-slot",        required_argument, NULL, 'c' },
-        { "poll-mode",          required_argument, NULL, 'L' },
+        { "create-slot",        no_argument,       NULL, 'c' },
+        { "poll-mode",          no_argument,       NULL, 'L' },
         { "fd",                 required_argument, NULL, 'D' },
         { "feedback-interval",  required_argument, NULL, 'F' },
         { "status-interval",    required_argument, NULL, 's' },
@@ -1095,6 +1125,9 @@ int main(int argc, char** argv)
         { "write-nl",           no_argument,       NULL, 'N' },
         { "wal2json1",          no_argument,       NULL, 'j' },
         { "wal2json2",          no_argument,       NULL, 'J' },
+        { "plugin",             required_argument, NULL, 'P' },
+        { "poll-duration",      required_argument, NULL, 'u' },
+        { "poll-interval",      required_argument, NULL, 'i' },
         { "dbname",             required_argument, NULL, 'd' },
         { "host",               required_argument, NULL, 'h' },
         { "port",               required_argument, NULL, 'p' },
@@ -1105,7 +1138,7 @@ int main(int argc, char** argv)
 
     int opt;
     int longindex;
-    while ((opt = getopt_long(argc, argv, "?vS:o:c:L:D:F:s:AHXNjJd:h:p:U:m:", longopts, &longindex)) != -1) {
+    while ((opt = getopt_long(argc, argv, "?vS:o:cLD:F:s:AHXNjJP:u:i:d:h:p:U:m:", longopts, &longindex)) != -1) {
         switch (opt) {
         case '?':
             showUsage();
@@ -1131,20 +1164,23 @@ int main(int argc, char** argv)
             }
             break;
         case 'c':
+            cfg_create_slot = true;
+            break;
+        case 'P':
             cfg_create_slot_plugin = optarg;
             break;
         case 'L':
             cfg_poll_mode = true;
-            {
-                char* endpos = NULL;
-                double v = strtod(optarg, &endpos);
-                cfg_poll_duration = (int) (v * 1000);
-                if (cfg_poll_duration < 0L || endpos != optarg + strlen(optarg)) {
-                    fprintf(stderr, "Invalid -L,--poll-mode option: %s\n", optarg);
-                    return ECODE_INVALID_ARGS;
-                }
+            break;
+        case 'u':
+            if (parseInterval(optarg,"-u,--poll-duration", &cfg_poll_duration) < 0) {
+                return ECODE_INVALID_ARGS;
             }
             break;
+        case 'i':
+            if (parseInterval(optarg,"-i,--poll-interval", &cfg_poll_interval) < 0) {
+                return ECODE_INVALID_ARGS;
+            }
             break;
         case 'A':
             cfg_auto_feedback = true;
@@ -1156,25 +1192,13 @@ int main(int argc, char** argv)
             cfg_fixed_header_length = true;
             break;
         case 'F':
-            {
-                char* endpos = NULL;
-                double v = strtod(optarg, &endpos);
-                cfg_feedback_interval = (int) (v * 1000);
-                if (cfg_feedback_interval < 0L || endpos != optarg + strlen(optarg)) {
-                    fprintf(stderr, "Invalid -F,--feedback-interval option: %s\n", optarg);
-                    return ECODE_INVALID_ARGS;
-                }
+            if (parseInterval(optarg,"-F,--feedback-interval", &cfg_feedback_interval) < 0) {
+                return ECODE_INVALID_ARGS;
             }
             break;
         case 's':
-            {
-                char* endpos = NULL;
-                double v = strtod(optarg, &endpos);
-                cfg_standby_message_interval = (int) (v * 1000);
-                if (cfg_standby_message_interval < 0L || endpos != optarg + strlen(optarg)) {
-                    fprintf(stderr, "Invalid -s,--status-interval option: %s\n", optarg);
-                    return ECODE_INVALID_ARGS;
-                }
+            if (parseInterval(optarg,"-s,--status-interval", &cfg_standby_message_interval) < 0) {
+                return ECODE_INVALID_ARGS;
             }
             break;
         case 'N':
@@ -1183,10 +1207,12 @@ int main(int argc, char** argv)
         case 'j':
             addConfigParamArg(&cfg_plugin_params, "format-version=1");
             addConfigParamArg(&cfg_plugin_params, "include-lsn=true");
+            cfg_create_slot_plugin = "wal2json";
             break;
         case 'J':
             addConfigParamArg(&cfg_plugin_params, "format-version=2");
             cfg_write_header = true;
+            cfg_create_slot_plugin = "wal2json";
             break;
         case 'd':
             addConfigParam(&cfg_pq_params, "dbname", optarg);
@@ -1222,23 +1248,27 @@ int main(int argc, char** argv)
     if (cfg_verbose) {
         fprintf(stderr, "Options:\n");
         fprintf(stderr, "  slot=%s\n", cfg_slot_name);
-        fprintf(stderr, "  create-slot=%s\n", (cfg_create_slot_plugin == NULL ? "" : cfg_create_slot_plugin));
+        fprintf(stderr, "  create-slot=%s\n", (cfg_create_slot ? "true" : "false"));
+        if (cfg_create_slot) {
+            fprintf(stderr, "  create-slot-plugin=%s\n", cfg_create_slot_plugin);
+        }
+        fprintf(stderr, "  poll-mode=%s\n", (cfg_poll_mode ? "true" : "false"));
         if (cfg_poll_mode) {
-            fprintf(stderr, "  poll-mode=%.3f\n", (cfg_poll_duration / 1000.0));
+            fprintf(stderr, "  poll-duration=%.3f\n", (cfg_poll_duration / 1000.0));
+            fprintf(stderr, "  poll-interval=%.3f\n", (cfg_poll_interval / 1000.0));
         }
         else {
-            fprintf(stderr, "  poll-mode=\n");
-        }
-        fprintf(stderr, "  feedback-interval=%.3f\n", (cfg_feedback_interval / 1000.0));
-        fprintf(stderr, "  status-interval=%.3f\n", (cfg_standby_message_interval / 1000.0));
-        fprintf(stderr, "  output-fd=%d\n", cfg_out_fd);
-        fprintf(stderr, "Plugin options:\n");
-        for (int i = 0; i < cfg_plugin_params.count; i++) {
-            if (cfg_plugin_params.values[i] != NULL) {
-                fprintf(stderr, "    %s=%s\n", cfg_plugin_params.keys[i], cfg_plugin_params.values[i]);
-            }
-            else {
-                fprintf(stderr, "    %s\n", cfg_plugin_params.keys[i]);
+            fprintf(stderr, "  feedback-interval=%.3f\n", (cfg_feedback_interval / 1000.0));
+            fprintf(stderr, "  status-interval=%.3f\n", (cfg_standby_message_interval / 1000.0));
+            fprintf(stderr, "  output-fd=%d\n", cfg_out_fd);
+            fprintf(stderr, "Plugin options:\n");
+            for (int i = 0; i < cfg_plugin_params.count; i++) {
+                if (cfg_plugin_params.values[i] != NULL) {
+                    fprintf(stderr, "  %s=%s\n", cfg_plugin_params.keys[i], cfg_plugin_params.values[i]);
+                }
+                else {
+                    fprintf(stderr, "  %s\n", cfg_plugin_params.keys[i]);
+                }
             }
         }
         fprintf(stderr, "Connection parameters:\n");

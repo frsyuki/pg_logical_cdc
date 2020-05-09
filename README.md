@@ -21,9 +21,8 @@ Options:
   -v, --verbose                show verbose messages
   -S, --slot NAME              name of the logical replication slot
   -o, --option KEY[=VALUE]     pass option NAME with optional value VALUE to the replication slot
-  -c, --create-slot NAME       create a logical replication slot if not exist using given plugin
-  -L, --poll-mode SECS         check availability of the replication slot at most given amount of time
-                               and then exit without outputting data
+  -c, --create-slot            create a replication slot if not exist using the plugin set to --P option
+  -L, --poll-mode              check availability of the replication slot then exit
   -D, --fd INTEGER             use the given file descriptor number instead of 1 (stdout)
   -F, --feedback-interval SEC  maximum delay to send feedback to the replication slot (default: 0.000)
   -s, --status-interval SECS   time between status messages sent to the server (default: 1.000)
@@ -31,8 +30,15 @@ Options:
   -H, --write-header           write a header line every before a record
   -X, --fixed-length-header    pad a header by spaces so that a header length becomes always 31 bytes
   -N, --write-nl               write a new line character every after a record
-  -j, --wal2json1              equivalent to -o format-version=1 -o include-lsn=true
-  -J  --wal2json2              equivalent to -o format-version=2 --write-header
+  -j, --wal2json1              equivalent to -o format-version=1 -o include-lsn=true -P wal2json
+  -J  --wal2json2              equivalent to -o format-version=2 --write-header -P wal2json
+
+Create slot options:
+  -P, --plugin NAME            logical decoder plugin for a new replication slot (default: test_decoding)
+
+Poll mode options:
+  -u, --poll-duration SECS     maximum amount of time to wait until slot becomes available (default: no limit)
+  -i, --poll-interval SECS     interval to check availability of a slot (default: 1.000)
 
 Connection options:
   -d, --dbname DBNAME      database name to connect to
@@ -57,6 +63,8 @@ pg_logical_stream --slot my_slot -HNJ
 You can find the list of available environment variables in [libpq document](https://www.postgresql.org/docs/11/libpq-envars.html).
 
 pg_logical_stream doesn't ask for password because STDIN is usually a program.
+
+Additional connection parameters can be set using `-m KEY=VALUE` option. Available parameters are listed in [libpq document](https://www.postgresql.org/docs/11/libpq-connect.html#LIBPQ-PARAMKEYWORDS).
 
 ## Protocol
 
@@ -154,23 +162,25 @@ use quit command instead.
 
 ## Poll mode
 
-If `--poll-mode SECS` is set, pg_logical_stream runs in poll mode. Poll mode is useful
+If `--poll-mode` is set, pg_logical_stream runs in poll mode. Poll mode is useful
 for HA configuration - a backup node takes over replication immediately when active node
 crashes.
 
 pg_logical_stream in poll mode doesn't output records. When it exits with code 0 (SUCCESS),
 run pg_logical_stream again without poll mode.
 
-Polling interval is configurable using --status-interval argument.
+if maximum amount of time set to `--poll-duration` passes, pg_logical_stream exits
+with exit code 9 (SLOT_IN_USE). It may also exit with 8 (SLOT_NOT_EXIST) if `--create-slot`
+is not set.
 
-Example use of poll-mode looks like as following:
+Example use of poll-mode is as following:
 
 ```
 #!/bin/sh
 
 while true; do
   # Run in poll mode.
-  pg_logical_stream --slot test_slot --poll-mode 60 --create-slot wal2json
+  pg_logical_stream --slot test_slot -J --poll-mode --poll-duration 60 --create-slot
   ecode=$?
 
   # If exist code is 0, slot is ready. Run pg_logical_stream without poll mode.
