@@ -10,8 +10,10 @@
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <fcntl.h>
-#include <libpq-fe.h>
+#include <time.h>
 #include <sys/select.h>
+#include <signal.h>
+#include <libpq-fe.h>
 #include <getopt.h>
 
 #define SQLSTATE_ERRCODE_OBJECT_IN_USE "55006"
@@ -49,6 +51,7 @@ static const char* cfg_create_slot_plugin = "test_decoding";
 static struct ConfigParams cfg_plugin_params;
 
 static bool cfg_poll_mode = false;
+static bool cfg_poll_has_duration = false;
 static long cfg_poll_duration = 0;
 static long cfg_poll_interval = 1000;
 
@@ -255,6 +258,7 @@ static int processRow(char* copybuf, int buflen,
 static int getCmdData(void)
 {
     if (s_cmd_fd_set_flags) {
+        // set non-blocking flag if necessary
         if (fcntl(cfg_cmd_fd, F_SETFL, s_cmd_fd_set_flags) < 0) {
             return -1;
         }
@@ -283,7 +287,7 @@ static int getCmdData(void)
 
 done:
     if (s_cmd_fd_set_flags) {
-        // Restore non-flags back
+        // Restore flags back
         if (fcntl(cfg_cmd_fd, F_SETFL, s_cmd_fd_set_flags | ~O_NONBLOCK) < 0) {
             return -1;
         }
@@ -680,7 +684,8 @@ static int setNonBlocking(void)
     if (out_flags & O_NONBLOCK) {
         // Setting non-blocking flag to STDIN sets non-blocking flag
         // also to STDOUT. This happens when they share the same
-        // socket or tty. In this case, call fcntl always around read.
+        // socket or tty on some platforms (darwin). In this case,
+        // call fcntl always around read.
         if (fcntl(cfg_out_fd, F_SETFL, out_flags & ~O_NONBLOCK) < 0) {
             return -1;
         }
@@ -999,11 +1004,12 @@ static ExitCode runPollLoop(PGconn* conn)
                 goto done;
             }
             // Re-check status immediately
+            cfg_create_slot = false;  // but don't try to create again
             continue;
         }
 
         // If timeout, exit.
-        if (cfg_poll_duration > 0) {
+        if (cfg_poll_has_duration) {
             int64_t now = feGetCurrentTimestamp();
             if (feTimestampDifferenceExceeds(started_at, now, cfg_poll_duration)) {
                 if (exist) {
@@ -1022,7 +1028,7 @@ static ExitCode runPollLoop(PGconn* conn)
         if (cfg_poll_interval > 0) {
             struct timespec sp;
             sp.tv_sec = (cfg_poll_interval / 1000);
-            sp.tv_nsec = (cfg_poll_interval % 1000) * 1000 * 1000 * 1000;
+            sp.tv_nsec = (cfg_poll_interval % 1000) * 1000 * 1000;
             if (cfg_verbose) {
                 if (exist) {
                     fprintf(stderr, "Slot is in use. Sleeping %.3f seconds.\n", (cfg_poll_interval / 1000.0));
@@ -1176,6 +1182,7 @@ int main(int argc, char** argv)
             cfg_poll_mode = true;
             break;
         case 'u':
+            cfg_poll_has_duration = true;
             if (parseInterval(optarg,"-u,--poll-duration", &cfg_poll_duration) < 0) {
                 return ECODE_INVALID_ARGS;
             }
@@ -1254,7 +1261,9 @@ int main(int argc, char** argv)
         }
         fprintf(stderr, "  poll-mode=%s\n", (cfg_poll_mode ? "true" : "false"));
         if (cfg_poll_mode) {
-            fprintf(stderr, "  poll-duration=%.3f\n", (cfg_poll_duration / 1000.0));
+            if (cfg_poll_has_duration) {
+                fprintf(stderr, "  poll-duration=%.3f\n", (cfg_poll_duration / 1000.0));
+            }
             fprintf(stderr, "  poll-interval=%.3f\n", (cfg_poll_interval / 1000.0));
         }
         else {

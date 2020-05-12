@@ -1,16 +1,23 @@
 # pg_logical_stream
 
 pg_logical_stream captures change data of a PostgreSQL in a programmable manner. It dumps
-[logical replication log stream](https://www.postgresql.org/docs/11/logical-replication.html) to STDOUT so that your application can capture changes made on PostgreSQL.
+[logical replication log stream](https://www.postgresql.org/docs/11/logical-replication.html) to
+STDOUT so that your application can capture changes applied to PostgreSQL.
 
-pg_logical_stream dumps a change record with a offset of the record (called `LSN`). Your application
+pg_logical_stream dumps a change record with a offset of the record in WAL (called `LSN`). Your application
 can use the offset as the unique identifier of the record. Also, once your application certainly consumes
 a record and doesn't need the same record again, put the offset to STDIN of pg_logical_stream (See Protocol
-section for details). Then, pg_logical_stream sends the offset to PostgreSQL server so that replication
-resumes from the offset when your application crashes & restarts.
+section for details). Then, pg_logical_stream feedback the offset to PostgreSQL server so that replication
+resumes from the offset when your application crashes & restarts. This ensures that your application
+receives all change data at least once.
 
-pg_logical_stream is similar to [pg_recvlogical](https://www.postgresql.org/docs/11/app-pgrecvlogical.html). pg_recvlogical writes captured
-change data to a file as a stand-alone tool, where pg_logical_stream is designed to run as a subprocess of an application.
+PostgreSQL's replication protocol allows to receive change data only from one client node at a time.
+pg_logical_stream supports poll-mode so that one of stand-by nodes can take over change data capturing
+immediately when the active node crashes.
+
+pg_logical_stream is similar to [pg_recvlogical](https://www.postgresql.org/docs/11/app-pgrecvlogical.html).
+pg_recvlogical writes captured change data to a file as a stand-alone tool. pg_logical_stream is
+designed to run as a subprocess of an application.
 
 ## Usage
 
@@ -24,7 +31,7 @@ Options:
   -c, --create-slot            create a replication slot if not exist using the plugin set to --P option
   -L, --poll-mode              check availability of the replication slot then exit
   -D, --fd INTEGER             use the given file descriptor number instead of 1 (stdout)
-  -F, --feedback-interval SEC  maximum delay to send feedback to the replication slot (default: 0.000)
+  -F, --feedback-interval SECS maximum delay to send feedback to the replication slot (default: 0.000)
   -s, --status-interval SECS   time between status messages sent to the server (default: 1.000)
   -A, --auto-feedback          send feedback automatically
   -H, --write-header           write a header line every before a record
@@ -153,8 +160,7 @@ q\n
 
 Sending SIGINT signal exits pg_logical_stream. However, quit command is recommended
 because SIGNAL may arrive earlier than processing a feedback command buffered in the
-pipe. To make sure that a feedback command written to STDIN is sent to PostgreSQL,
-use quit command instead.
+pipe. To make sure that feedback is sent to PostgreSQL, use quit command instead.
 
 
 ## Poll mode
@@ -163,12 +169,12 @@ If `--poll-mode` is set, pg_logical_stream runs in poll mode. Poll mode is usefu
 for HA configuration - a backup node takes over replication immediately when active node
 crashes.
 
-pg_logical_stream in poll mode doesn't output records. When it exits with code 0 (SUCCESS),
-run pg_logical_stream again without poll mode.
+pg_logical_stream running in poll mode doesn't output records. When it exits wit
+code 0 (SUCCESS), run pg_logical_stream again without poll mode.
 
-if maximum amount of time set to `--poll-duration` passes, pg_logical_stream exits
+If maximum amount of time passes (`--poll-duration` option), pg_logical_stream exits
 with exit code 9 (SLOT_IN_USE). It may also exit with 8 (SLOT_NOT_EXIST) if `--create-slot`
-is not set.
+is not set. If 0 is set to `--poll-duration`, it exits immediately after the first check.
 
 Example use of poll-mode is as following:
 
@@ -205,7 +211,7 @@ done
 * 5 = PG_ERROR. An error occurred during dealing with the PostgreSQL connection.
 * 6 = CMD_ERROR. An error occurred during dealing with STDIN.
 * 7 = SYSTEM_ERROR. Other fatal errors.
-* 8 = SLOT_NOT_EXIST. Replication slot does not exist or is not accessible.
+* 8 = SLOT_NOT_EXIST. Replication slot does not exist.
 * 9 = SLOT_IN_USE. Replication slot is being used by another client.
 
 ## Example code
@@ -265,7 +271,7 @@ You will get `pg_logical_stream` in ./src directory.
 
 Pre-requirements:
 
-* A running PostgreSQL server with a database created
+* A running PostgreSQL server, with a database created, and running with wal_level=logical
 * libpq installed with development headers
 * ruby installed with `bundler` gem
 

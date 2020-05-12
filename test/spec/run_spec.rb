@@ -2,14 +2,17 @@ require_relative 'spec_helper'
 
 HEADER_REGEXP = /^w (?<lsn>[0-9A-F]+\/[0-9A-F]+) (?<len>[0-9]+)$/
 
-RSpec.describe "run" do
+RSpec.describe "pg_logical_stream" do
   let(:suffix) do
-    #"%08x" % rand(2**32)
-    "z"
+    "z" #"%08x" % rand(2**32)
   end
 
   let(:slot_name) do
-    "pg_logical_stream_test_slot_#{suffix}"
+    "pg_logical_stream_test_s1_#{suffix}"
+  end
+
+  let(:alt_slot_name) do
+    "pg_logical_stream_test_s2_#{suffix}"
   end
 
   let(:table1) do
@@ -389,7 +392,7 @@ RSpec.describe "run" do
 
   it "returns CMD_CLOSED when stdin is closed" do
     stat = cmd(slot_name, "-N --wal2json2 -v") do |c|
-      h = c.stdin.close
+      c.stdin.close
 
       # Wait for completion
       c.stdout.read
@@ -397,5 +400,121 @@ RSpec.describe "run" do
 
     # Exit code is CMD_CLOSED.
     expect(stat.exitstatus).to eq(4)
+  end
+
+  it "takes over crashed node immediately using poll mode" do
+    # Node 1 - sleep 2 then exit
+    node1 = Thread.new do
+      cmd(slot_name, "-N --wal2json2 -v") do |c|
+        sleep 2
+
+        c.stdin.puts "q"
+
+        # Wait for completion
+        c.stdout.read
+      end
+    end
+
+    begin
+      # Node 2 - poll-interval=0.5
+      node_started = Time.now
+      # sleep 0.5 to wait for starting node1
+      sleep 0.5
+      stat = cmd(slot_name, "--poll-mode --poll-interval 0.5") do |c|
+        # Wait for completion
+        c.stdout.read
+      end
+      node_duration = Time.now - node_started
+
+      expect(node_duration).to be < 3.0
+
+      # Exit code is SUCCESS.
+      expect(stat.exitstatus).to eq(0)
+
+    ensure
+      node1.join
+    end
+  end
+
+  it "times out poll-mode" do
+    # Node 1 - sleep 3 then exit
+    node1 = Thread.new do
+      cmd(slot_name, "-N --wal2json2 -v") do |c|
+        sleep 3
+        c.stdin.puts "q"
+        c.stdout.read
+      end
+    end
+
+    begin
+      # Node 2 - poll-interval=0.5, poll-duration=1
+      # sleep 0.5 to wait for starting node1
+      sleep 0.5
+      poll_started = Time.now
+      stat = cmd(slot_name, "--poll-mode --poll-interval 0.5 --poll-duration 1.0") do |c|
+        # Wait for completion
+        c.stdout.read
+      end
+      poll_duration = Time.now - poll_started
+
+      expect(poll_duration).to be < 2.0
+
+      # Exit code is SLOT_IN_USE.
+      expect(stat.exitstatus).to eq(9)
+
+    ensure
+      node1.join
+    end
+  end
+
+  it "creates a slot" do
+    dropped = false
+    begin
+      cmd(alt_slot_name, "--create-slot --plugin wal2json") do |c|
+        c.stdin.puts "q"
+        c.stdout.read
+      end
+    ensure
+      pg_drop_slot(alt_slot_name)
+      dropped = true
+    end
+    expect(dropped).to be(true)
+  end
+
+  it "creates a slot with poll-mode" do
+    stat = nil
+    dropped = false
+    begin
+      stat = cmd(alt_slot_name, "--create-slot --plugin wal2json --poll-mode --poll-duration 0") do |c|
+        c.stdin.puts "q"
+        c.stdout.read
+      end
+    ensure
+      pg_drop_slot(alt_slot_name)
+      dropped = true
+    end
+    expect(dropped).to be(true)
+    expect(stat.exitstatus).to be(0)
+  end
+
+  it "sets various connection options" do
+    stat_exists = false
+    stat = cmd(slot_name, "-m application_name=pg_logical_stream_test -m connect_timeout=5 -m keepalives_idle=50 -m keepalives_interval=10 -m keepalives_count=4 -m sslmode=prefer -v") do |c|
+      sleep 0.5
+      r = pg_exec("select * from pg_stat_activity where application_name='pg_logical_stream_test'")
+      r.each {|row| stat_exists = true }
+
+      c.stdin.puts "q"
+      c.stdout.read
+
+      expect(c.stderr).to include("application_name=pg_logical_stream_test")
+      expect(c.stderr).to include("connect_timeout=5")
+      expect(c.stderr).to include("keepalives_idle=50")
+      expect(c.stderr).to include("keepalives_interval=10")
+      expect(c.stderr).to include("keepalives_count=4")
+      expect(c.stderr).to include("sslmode=prefer")
+    end
+    expect(stat.exitstatus).to be(0)
+    expect(stat_exists).to be(true)
   end
 end
