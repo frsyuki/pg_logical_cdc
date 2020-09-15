@@ -1087,7 +1087,7 @@ static void showUsage(void)
     printf("  -A, --auto-feedback          send feedback automatically\n");
     printf("  -H, --write-header           write a header line every before a record\n");
     printf("  -N, --write-nl               write a new line character every after a record\n");
-    printf("  -j, --wal2json1              equivalent to -o format-version=1 -o include-lsn=true -P wal2json\n");
+    printf("  -j, --wal2json1              equivalent to -o include-lsn=true -P wal2json\n");
     printf("  -J  --wal2json2              equivalent to -o format-version=2 --write-header -P wal2json\n");
     printf("\nCreate slot options:\n");
     printf("  -P, --plugin NAME            logical decoder plugin for a new replication slot (default: test_decoding)\n");
@@ -1099,7 +1099,9 @@ static void showUsage(void)
     printf("  -h, --host HOSTNAME      database server host or socket directory\n");
     printf("  -p, --port PORT          database server port\n");
     printf("  -U, --username USERNAME  database user name\n");
-    printf("  -m, --param KEY=VALUE    database connection parameter (connect_timeout, application_name, etc.)\n");
+    printf("  -m, --param KEY=VALUE    database connection parameter\n");
+    printf("\nCommon environment variables:\n");
+    printf("  PGPASSWORD, PGUSER, PGDATABASE, PGHOST, PGPORT, PGSSLMODE, PGAPPNAME\n");
 }
 
 static int parseInterval(const char* arg, const char* arg_name, long* r_millis)
@@ -1212,7 +1214,8 @@ int main(int argc, char** argv)
             cfg_write_nl = true;
             break;
         case 'j':
-            addConfigParamArg(&cfg_plugin_params, "format-version=1");
+            // Old wal2json doesn't support format-version option itself
+            //addConfigParamArg(&cfg_plugin_params, "format-version=1");
             addConfigParamArg(&cfg_plugin_params, "include-lsn=true");
             cfg_create_slot_plugin = "wal2json";
             break;
