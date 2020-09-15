@@ -1,0 +1,4 @@
+/test/vendor/
+/test/.bundle
+/test/.bundlerw
+/src/pg_logical_cdc
