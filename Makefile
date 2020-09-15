@@ -1,4 +1,4 @@
-EXE := $(shell pwd)/src/pg_logical_stream
+EXE := $(shell pwd)/src/pg_logical_cdc
 
 all: test
 
@@ -16,6 +16,6 @@ clean:
 	rm -rf test/.bundlerw
 
 docker:
-	docker build --rm -t pg_logical_stream:latest .
+	docker build --rm -t pg_logical_cdc:latest .
 
 .PHONY: test all clean docker

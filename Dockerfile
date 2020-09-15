@@ -14,6 +14,6 @@ RUN sudo -u postgres /mnt/test/setup_postgres.sh /usr/lib/postgresql/11/bin /var
     env PGHOST=localhost PGUSER=postgres PGDATABASE=test make
 
 FROM postgres:11
-COPY --from=builder /mnt/src/pg_logical_stream /usr/bin/
-CMD pg_logical_stream
+COPY --from=builder /mnt/src/pg_logical_cdc /usr/bin/
+CMD pg_logical_cdc
 

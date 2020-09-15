@@ -1,22 +1,22 @@
-# pg_logical_stream
+# pg_logical_cdc
 
-pg_logical_stream captures change data of a PostgreSQL in a programmable manner. It dumps
+pg_logical_cdc captures change data of a PostgreSQL in a programmable manner. It dumps
 [logical replication log stream](https://www.postgresql.org/docs/11/logical-replication.html) to
 STDOUT so that your application can capture changes applied to PostgreSQL.
 
-pg_logical_stream dumps a change record with a offset of the record in WAL (called `LSN`). Your application
+pg_logical_cdc dumps a change record with a offset of the record in WAL (called `LSN`). Your application
 can use the offset as the unique identifier of the record. Also, once your application certainly consumes
-a record and doesn't need the same record again, put the offset to STDIN of pg_logical_stream (See Protocol
-section for details). Then, pg_logical_stream feedback the offset to PostgreSQL server so that replication
+a record and doesn't need the same record again, put the offset to STDIN of pg_logical_cdc (See Protocol
+section for details). Then, pg_logical_cdc feedback the offset to PostgreSQL server so that replication
 resumes from the offset when your application crashes & restarts. This ensures that your application
 receives all change data at least once.
 
 PostgreSQL's replication protocol allows to receive change data only from one client node at a time.
-pg_logical_stream supports poll-mode so that one of stand-by nodes can take over change data capturing
+pg_logical_cdc supports poll-mode so that one of stand-by nodes can take over change data capturing
 immediately when the active node crashes.
 
-pg_logical_stream is similar to [pg_recvlogical](https://www.postgresql.org/docs/11/app-pgrecvlogical.html).
-pg_recvlogical writes captured change data to a file as a stand-alone tool. pg_logical_stream is
+pg_logical_cdc is similar to [pg_recvlogical](https://www.postgresql.org/docs/11/app-pgrecvlogical.html).
+pg_recvlogical writes captured change data to a file as a stand-alone tool. pg_logical_cdc is
 designed to run as a subprocess of an application.
 
 ## Usage
@@ -63,12 +63,12 @@ Using `PGPASSWORD` environment variable is the recommended way to set password. 
 ```
 export PGUSER=foo
 export PGPASSWORD=foobar
-pg_logical_stream --slot my_slot -HNJ
+pg_logical_cdc --slot my_slot -HNJ
 ```
 
 You can find the list of available environment variables in [libpq document](https://www.postgresql.org/docs/11/libpq-envars.html).
 
-pg_logical_stream doesn't ask for password because STDIN is usually a program.
+pg_logical_cdc doesn't ask for password because STDIN is usually a program.
 
 Additional connection parameters can be set using `-m KEY=VALUE` option. Available parameters are listed in [libpq document](https://www.postgresql.org/docs/11/libpq-connect.html#LIBPQ-PARAMKEYWORDS).
 
@@ -87,10 +87,10 @@ select * from pg_create_logical_replication_slot('test_slot', 'wal2json');
 ```
 
 It creates a slot named `test_slot` using `wal2json` plugin.
-Then, you can start pg_logical_stream with the slot name:
+Then, you can start pg_logical_cdc with the slot name:
 
 ```
-pg_logical_stream --slot test_slot
+pg_logical_cdc --slot test_slot
 ```
 
 You will see JSON outputs when you make changes on tables.
@@ -98,7 +98,7 @@ You will see JSON outputs when you make changes on tables.
 Example output is:
 
 ```
-$ ./pg_logical_stream --slot test_slot -N
+$ ./pg_logical_cdc --slot test_slot -N
 {"change":[{"kind":"insert","schema":"public","table":"test","columnnames":["id","n1","n2","n3","n4"],"columntypes":["integer","bigint","bigint","bigint","bigint"],"columnvalues":[108,5,5,5,5]}]}
 {"change":[{"kind":"insert","schema":"public","table":"test","columnnames":["id","n1","n2","n3","n4"],"columntypes":["integer","bigint","bigint","bigint","bigint"],"columnvalues":[109,5,5,5,5]}]}
 {"change":[{"kind":"insert","schema":"public","table":"test","columnnames":["id","n1","n2","n3","n4"],"columntypes":["integer","bigint","bigint","bigint","bigint"],"columnvalues":[110,5,5,5,5]}]}
@@ -107,7 +107,7 @@ $ ./pg_logical_stream --slot test_slot -N
 
 ### Output header
 
-If you give `--write-header` option, pg_logical_stream dumps a record with a header.
+If you give `--write-header` option, pg_logical_cdc dumps a record with a header.
 
 Format of a header is:
 
@@ -124,7 +124,7 @@ w <LSN> <LENGTH>\n
 Example output is:
 
 ```
-$ ./pg_logical_stream --slot test_slot -N --write-header
+$ ./pg_logical_cdc --slot test_slot -N --write-header
 w 0/2B357690 196
 {"change":[{"kind":"insert","schema":"public","table":"test","columnnames":["id","n1","n2","n3","n4"],"columntypes":["integer","bigint","bigint","bigint","bigint"],"columnvalues":[108,5,5,5,5]}]}
 w 0/2B357890 196
@@ -158,21 +158,21 @@ q\n
 
 ### SIGINT signal
 
-Sending SIGINT signal exits pg_logical_stream. However, quit command is recommended
+Sending SIGINT signal exits pg_logical_cdc. However, quit command is recommended
 because SIGNAL may arrive earlier than processing a feedback command buffered in the
 pipe. To make sure that feedback is sent to PostgreSQL, use quit command instead.
 
 
 ## Poll mode
 
-If `--poll-mode` is set, pg_logical_stream runs in poll mode. Poll mode is useful
+If `--poll-mode` is set, pg_logical_cdc runs in poll mode. Poll mode is useful
 for HA configuration - a backup node takes over replication immediately when active node
 crashes.
 
-pg_logical_stream running in poll mode doesn't output records. When it exits wit
-code 0 (SUCCESS), run pg_logical_stream again without poll mode.
+pg_logical_cdc running in poll mode doesn't output records. When it exits wit
+code 0 (SUCCESS), run pg_logical_cdc again without poll mode.
 
-If maximum amount of time passes (`--poll-duration` option), pg_logical_stream exits
+If maximum amount of time passes (`--poll-duration` option), pg_logical_cdc exits
 with exit code 9 (SLOT_IN_USE). It may also exit with 8 (SLOT_NOT_EXIST) if `--create-slot`
 is not set. If 0 is set to `--poll-duration`, it exits immediately after the first check.
 
@@ -183,12 +183,12 @@ Example use of poll-mode is as following:
 
 while true; do
   # Run in poll mode.
-  pg_logical_stream --slot test_slot -J --poll-mode --poll-duration 60 --create-slot
+  pg_logical_cdc --slot test_slot -J --poll-mode --poll-duration 60 --create-slot
   ecode=$?
 
-  # If exist code is 0, slot is ready. Run pg_logical_stream without poll mode.
+  # If exist code is 0, slot is ready. Run pg_logical_cdc without poll mode.
   if [ $ecode -eq 0 ]; then
-    pg_logical_stream --slot test_slot -J
+    pg_logical_cdc --slot test_slot -J
     ecode=$?
   fi
 
@@ -219,8 +219,8 @@ done
 ```
 #!/usr/bin/env ruby
 
-# Start pg_logical_stream
-pipe = IO.popen("pg_logical_stream --slot test_slot --wal2json2", "r+")
+# Start pg_logical_cdc
+pipe = IO.popen("pg_logical_cdc --slot test_slot --wal2json2", "r+")
 
 while true
   # Receive a header line from STDOUT
@@ -245,13 +245,15 @@ end
 
 ### Build and test using docker
 
+Docker is the recommended way to run build and tests reliably.
+
 ```
-make clean docker
+make docker
 ```
 
-You will get `pg_logical_stream` in src/.
+You will get `pg_logical_cdc` in src/.
 
-### Build
+### Build without docker
 
 Please make sure that `libpq` is installed with development headers.
 
@@ -265,9 +267,9 @@ Once libpq is installed, run `make` on ./src directory as following:
 make -C ./src
 ```
 
-You will get `pg_logical_stream` in ./src directory.
+You will get `pg_logical_cdc` in ./src directory.
 
-### Test
+### Test without docker
 
 Pre-requirements:
 
@@ -287,4 +289,10 @@ $ make test
 # Running one test only
 $ SPEC=spec/run_spec.rb:117 make test
 ```
+
+## License
+
+Copyright (c) 2020 Sadayuki Furuhashi
+
+Apache License, Version 2.0
 

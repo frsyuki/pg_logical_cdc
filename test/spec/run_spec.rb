@@ -2,25 +2,25 @@ require_relative 'spec_helper'
 
 HEADER_REGEXP = /^w (?<lsn>[0-9A-F]+\/[0-9A-F]+) (?<len>[0-9]+)$/
 
-RSpec.describe "pg_logical_stream" do
+RSpec.describe "pg_logical_cdc" do
   let(:suffix) do
     "z" #"%08x" % rand(2**32)
   end
 
   let(:slot_name) do
-    "pg_logical_stream_test_s1_#{suffix}"
+    "pg_logical_cdc_test_s1_#{suffix}"
   end
 
   let(:alt_slot_name) do
-    "pg_logical_stream_test_s2_#{suffix}"
+    "pg_logical_cdc_test_s2_#{suffix}"
   end
 
   let(:table1) do
-    "pg_logical_stream_test_t1_#{suffix}"
+    "pg_logical_cdc_test_t1_#{suffix}"
   end
 
   let(:table2) do
-    "pg_logical_stream_test_t2_#{suffix}"
+    "pg_logical_cdc_test_t2_#{suffix}"
   end
 
   before(:each) do
@@ -499,15 +499,15 @@ RSpec.describe "pg_logical_stream" do
 
   it "sets various connection options" do
     stat_exists = false
-    stat = cmd(slot_name, "-m application_name=pg_logical_stream_test -m connect_timeout=5 -m keepalives_idle=50 -m keepalives_interval=10 -m keepalives_count=4 -m sslmode=prefer -v") do |c|
+    stat = cmd(slot_name, "-m application_name=pg_logical_cdc_test -m connect_timeout=5 -m keepalives_idle=50 -m keepalives_interval=10 -m keepalives_count=4 -m sslmode=prefer -v") do |c|
       sleep 0.5
-      r = pg_exec("select * from pg_stat_activity where application_name='pg_logical_stream_test'")
+      r = pg_exec("select * from pg_stat_activity where application_name='pg_logical_cdc_test'")
       r.each {|row| stat_exists = true }
 
       c.stdin.puts "q"
       c.stdout.read
 
-      expect(c.stderr).to include("application_name=pg_logical_stream_test")
+      expect(c.stderr).to include("application_name=pg_logical_cdc_test")
       expect(c.stderr).to include("connect_timeout=5")
       expect(c.stderr).to include("keepalives_idle=50")
       expect(c.stderr).to include("keepalives_interval=10")
